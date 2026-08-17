@@ -1,5 +1,0 @@
-# 项目级配置
-# 全局 ~/.cargo/config.toml 的 rsproxy-sparse 已临时禁用，直接使用官方 crates.io
-
-[net]
-git-fetch-with-cli = true
