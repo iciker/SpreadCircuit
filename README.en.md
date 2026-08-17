@@ -169,7 +169,22 @@ The currently documented non-validator requirements are:
 - Public TCP ports 4001 and 4002 for P2P gossip;
 - For latency-sensitive workloads, a Tokyo region is preferred.
 
-The node may produce approximately 100 GB of data and logs per day. Configure disk monitoring and a suitable archival or cleanup policy. RPC port 3001 should not be exposed directly to the public internet. Remote access should use at least firewall allowlists, TLS, rate limiting, and access control.
+**Tested minimum configuration.** We have run this node for extended periods on a 4 vCPU / 8 GB RAM / 200 GB SSD machine with automatic data and log cleanup every 8 hours. It syncs reliably and keeps serving EVM RPC, which is sufficient for this project's quoting and execution. The official specification targets general-purpose non-validator use; when the node only serves as this project's RPC backend, the tested configuration is a reasonable starting point — scale up based on observed disk growth and memory pressure.
+
+The node may produce approximately 100 GB of data and logs per day; a 200 GB disk fills in under two days without cleanup. A cleanup policy is what makes the smaller machine viable long-term. Run it via cron every 8 hours:
+
+```bash
+crontab -e
+```
+
+```cron
+# Every 8 hours, delete node data and logs older than 8 hours (adjust the path to your data directory)
+0 */8 * * * find ~/hl/data -type f -mmin +480 -delete 2>/dev/null; find ~/hl/data -type d -empty -delete 2>/dev/null
+```
+
+Cleanup only removes historical data files; the node keeps syncing and serving RPC, and `hl-visor` continues writing new blocks. After first bringing the node up, watch one or two cleanup cycles and confirm with `df -h` and `du -sh ~/hl/data` that disk usage settles within the expected range.
+
+RPC port 3001 should not be exposed directly to the public internet. Remote access should use at least firewall allowlists, TLS, rate limiting, and access control.
 
 ### 2. Download and verify the official binary
 
