@@ -10,9 +10,7 @@
 *.db-shm
 logs/
 ts-legacy/
-docs/archive/
-docs/plans/
-docs/testing/
+/docs/
 *.log
 .DS_Store
 CLAUDE.md

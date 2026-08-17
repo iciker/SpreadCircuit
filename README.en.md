@@ -94,7 +94,7 @@ HYPE_BID_DIFF_PERCENT=36
 HYPE_ENABLE_SELL_ARB=false
 ```
 
-`.env_example` contains the complete pair configuration, token precision, cost parameters, and DEX contract settings. Contract addresses and pool availability can change; verify them independently against official sources and the [DEX address reference](docs/quote,路由地址和官方网站.md) before use.
+`.env_example` contains the complete pair configuration, token precision, cost parameters, and DEX contract settings. Contract addresses and pool availability can change; verify them independently against official sources before use.
 
 ### 3. Build
 
@@ -130,7 +130,7 @@ The default metrics endpoint is `http://127.0.0.1:9090/metrics`:
 curl http://127.0.0.1:9090/metrics | grep arb_
 ```
 
-See the [monitoring guide](docs/grafana-dashboard.md) for Prometheus and Grafana setup, or directly import the provided [Grafana dashboard JSON](docs/grafana-dashboard.json).
+See the monitoring guide for Prometheus and Grafana setup, or directly import the provided [Grafana dashboard JSON](grafana-dashboard.json).
 
 ### 6. Enable live trading
 

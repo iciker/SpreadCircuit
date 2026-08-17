@@ -94,7 +94,7 @@ HYPE_BID_DIFF_PERCENT=36
 HYPE_ENABLE_SELL_ARB=false
 ```
 
-`.env_example` 已包含完整的交易对、代币精度、成本参数和 DEX 合约配置。合约地址和池可用性可能变化，使用前应对照官方来源和 [DEX 地址说明](docs/quote,路由地址和官方网站.md) 独立确认。
+`.env_example` 已包含完整的交易对、代币精度、成本参数和 DEX 合约配置。合约地址和池可用性可能变化，使用前应对照官方来源独立确认。
 
 ### 3. 编译
 
@@ -130,7 +130,7 @@ cargo build --release
 curl http://127.0.0.1:9090/metrics | grep arb_
 ```
 
-Grafana 配置说明见 [监控文档](docs/grafana-dashboard.md)，也可以直接导入 [Dashboard JSON](docs/grafana-dashboard.json)。
+Grafana 配置说明见监控文档，也可以直接导入 [Dashboard JSON](grafana-dashboard.json)。
 
 ### 6. 启用实盘
 
