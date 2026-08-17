@@ -5,7 +5,7 @@ use tokio::{
     task::JoinSet,
 };
 use tokio_util::sync::CancellationToken;
-use tracing::info;
+use tracing::{error, info};
 use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt};
 
 use spread_circuit::{
@@ -51,19 +51,18 @@ async fn main() -> anyhow::Result<()> {
 
     spread_circuit::metrics::init();
 
-    let pairs = config.pairs();
-    let recovery_connection = rusqlite::Connection::open(&config.db_path)?;
-    db::init(&recovery_connection)?;
-    let unresolved = db::list_recoveries(&recovery_connection)?;
+    let pairs = config.pairs.clone();
+    let unresolved = db::list_recoveries_at(&config.db_path)?;
     db::ensure_startup_safe(config.dry_run, &unresolved)?;
 
-    let mut prepared_pairs = Vec::with_capacity(pairs.len());
-    for pair in &pairs {
+    // 各 pair 的 HL 客户端构造相互独立，并发进行，启动时间不随 pair 数线性膨胀
+    let prepared_pairs = futures_util::future::try_join_all(pairs.iter().map(|pair| async {
         let client = LiquidClient::new(&config.private_key, &pair.spot_coin, &pair.symbol).await?;
         let rules = client.rules();
         validate_configured_size(pair.order_size_token1, rules.size_decimals)?;
-        prepared_pairs.push((pair.clone(), client, rules));
-    }
+        anyhow::Ok((pair.clone(), client, rules))
+    }))
+    .await?;
     info!(
         dry_run = config.dry_run,
         metrics_port = config.metrics_port,
@@ -73,9 +72,15 @@ async fn main() -> anyhow::Result<()> {
 
     let shutdown = CancellationToken::new();
     let evm_execution_gate = Arc::new(Mutex::new(()));
+    // 全进程共享一个报价 HTTP 连接池：watcher 每块报价保持连接温热，
+    // trader 延迟敏感的 re-quote 免付冷启动 TCP/TLS 握手
+    let quote_provider = spread_circuit::evm::client::build_http_provider(&config.https_rpc)?;
     let shutdown_ctrl_c = shutdown.clone();
     tokio::spawn(async move {
-        tokio::signal::ctrl_c().await.ok();
+        if let Err(e) = tokio::signal::ctrl_c().await {
+            // 信号处理器注册失败：无法再感知 Ctrl-C，触发安全关闭而非静默运行
+            error!(error = %e, "[Main] Ctrl-C 信号处理器注册失败，触发安全关闭");
+        }
         info!("[Main] 收到退出信号，开始优雅关闭");
         shutdown_ctrl_c.cancel();
     });
@@ -102,6 +107,7 @@ async fn main() -> anyhow::Result<()> {
         evm_watcher::run(
             Arc::clone(&config),
             pairs.clone(),
+            quote_provider.clone(),
             evm_price_tx.clone(),
             shutdown.clone(),
         ),
@@ -145,6 +151,7 @@ async fn main() -> anyhow::Result<()> {
             evm_trader::run(
                 Arc::clone(&config),
                 Arc::clone(&pair),
+                quote_provider.clone(),
                 evm_cmd_rx,
                 result_tx.clone(),
                 evm_execution_gate.clone(),
@@ -176,7 +183,7 @@ async fn main() -> anyhow::Result<()> {
             result_rx,
             price_record_tx.clone(),
             liquid_rules,
-        );
+        )?;
         spawn_actor(&mut tasks, arb_name, arb.run(shutdown.clone()));
     }
 

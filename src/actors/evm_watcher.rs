@@ -7,26 +7,27 @@ use tracing::{info, warn};
 
 use crate::{
     config::{Config, PairConfig},
-    evm::{
-        algebra_client::AlgebraQuoterClient,
-        client::{build_http_provider, EvmClient},
-    },
+    evm::{algebra_client::AlgebraQuoterClient, build_quoters, client::EvmClient},
     types::market::{unix_timestamp_ms, DexName, EvmPrice},
 };
 
 /// 报价基准金额（100 个 token0 单位），buy_price = QUOTE_AMOUNT / token_out
 const QUOTE_AMOUNT: f64 = 100.0;
+/// 无新块超过此时长视为半开连接，断开重连（HyperEVM 出块间隔约 2 秒）
+const BLOCK_IDLE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
 
 pub async fn run(
     config: Arc<Config>,
     pairs: Vec<PairConfig>,
+    quote_provider: crate::evm::client::EthProvider,
     tx: broadcast::Sender<EvmPrice>,
     shutdown: CancellationToken,
 ) {
     super::run_with_backoff(
-        || connect_and_listen(&config, &pairs, &tx, &shutdown),
+        || connect_and_listen(&config, &pairs, quote_provider.clone(), &tx, &shutdown),
         "EvmWatcher",
         &shutdown,
+        &config,
     )
     .await;
     info!("[EvmWatcher] 已退出");
@@ -35,27 +36,12 @@ pub async fn run(
 async fn connect_and_listen(
     config: &Config,
     pairs: &[PairConfig],
+    quote_provider: crate::evm::client::EthProvider,
     tx: &broadcast::Sender<EvmPrice>,
     shutdown: &CancellationToken,
 ) -> Result<()> {
-    // 三个 client 共享同一 HTTP provider，避免为相同 RPC URL 创建多个连接池
-    let http_provider = build_http_provider(&config.https_rpc)?;
-    let prjx_client = EvmClient::from_provider(http_provider.clone(), &config.prjx_quotev2)?;
-    let hyper_client = EvmClient::from_provider(http_provider.clone(), &config.hyperswap_quotev2)?;
-    let kitten_client = if config.kitten_quoter.is_empty() {
-        None
-    } else if config.kitten_router.is_empty() {
-        // KITTEN_QUOTER 有值但 KITTEN_ROUTER 为空：报价会选出 DexName::Kitten，
-        // 但每次套利触发都会因 router 缺失而失败，产生大量虚假错误指标。
-        // 强制禁用 kitten 报价，直到两者均配置。
-        tracing::error!("[EvmWatcher] KITTEN_QUOTER 已配置但 KITTEN_ROUTER 为空，KittenSwap 已禁用。请同时配置 KITTEN_QUOTER 和 KITTEN_ROUTER，或两者均不配置");
-        None
-    } else {
-        Some(AlgebraQuoterClient::from_provider(
-            http_provider,
-            &config.kitten_quoter,
-        )?)
-    };
+    // 三个 client 共享进程级 HTTP provider；kitten 仅在配置了 KITTEN_QUOTER 时启用
+    let (prjx_client, hyper_client, kitten_client) = build_quoters(quote_provider, config)?;
 
     let ws = WsConnect::new(&config.wss_rpc);
     let provider = ProviderBuilder::new().on_ws(ws).await?;
@@ -74,8 +60,13 @@ async fn connect_and_listen(
 
     loop {
         tokio::select! {
-            block = subscription.recv() => {
-                let block = block?;
+            block = tokio::time::timeout(BLOCK_IDLE_TIMEOUT, subscription.recv()) => {
+                let block = match block {
+                    Ok(block) => block?,
+                    Err(_) => anyhow::bail!(
+                        "超过 {BLOCK_IDLE_TIMEOUT:?} 未收到新块，判定半开连接，重连"
+                    ),
+                };
                 let block_number = block.number;
 
                 // 所有 pair 并行报价：调用侧将 bool 转为 Option，fetch_prices 不感知 pair 配置
@@ -136,26 +127,14 @@ async fn fetch_prices(
         quote_optional_algebra_pair(kitten, pair),
     );
 
-    let mut candidates_buy = Vec::with_capacity(3);
-    let mut candidates_sell = Vec::with_capacity(3);
-    push_quote_pair(
-        &mut candidates_buy,
-        &mut candidates_sell,
-        DexName::Prjx,
-        Some(prjx_quotes),
-    );
-    push_quote_pair(
-        &mut candidates_buy,
-        &mut candidates_sell,
-        DexName::HyperSwap,
-        hyper_quotes,
-    );
-    push_quote_pair(
-        &mut candidates_buy,
-        &mut candidates_sell,
-        DexName::Kitten,
-        kitten_quotes,
-    );
+    let (candidates_buy, candidates_sell): (Vec<_>, Vec<_>) = [
+        (DexName::Prjx, Some(prjx_quotes)),
+        (DexName::HyperSwap, hyper_quotes),
+        (DexName::Kitten, kitten_quotes),
+    ]
+    .into_iter()
+    .filter_map(|(dex, quotes)| quotes.map(|(buy, sell)| ((buy, dex), (sell, dex))))
+    .unzip();
 
     let (buy_raw, buy_dex) = best_of(candidates_buy, true, "buy")?;
     let (sell_raw, sell_dex) = best_of(candidates_sell, false, "sell")?;
@@ -227,66 +206,36 @@ async fn quote_optional_algebra_pair(
     ))
 }
 
-fn push_quote_pair(
-    buy_candidates: &mut Vec<(Result<f64>, DexName)>,
-    sell_candidates: &mut Vec<(Result<f64>, DexName)>,
-    dex: DexName,
-    quotes: Option<QuotePair>,
-) {
-    if let Some((buy, sell)) = quotes {
-        buy_candidates.push((buy, dex));
-        sell_candidates.push((sell, dex));
-    }
-}
-
 /// buy=true 取最大值（更多 tokenOut），buy=false 取最小值（更少 tokenIn）
-/// 至少一个成功才返回 Ok
+/// 至少一个成功才返回 Ok；失败/为零（无流动性）的报价逐条 warn 后跳过
 fn best_of(
     candidates: Vec<(Result<f64>, DexName)>,
     prefer_max: bool,
     label: &str,
 ) -> Result<(f64, DexName)> {
-    let mut best: Option<(f64, DexName)> = None;
-    let mut last_err: Option<String> = None;
-
-    for (result, dex) in candidates {
-        match result {
-            Ok(v) if v > 0.0 => {
-                let is_better = match best {
-                    None => true,
-                    Some((cur, _)) => {
-                        if prefer_max {
-                            v > cur
-                        } else {
-                            v < cur
-                        }
-                    }
-                };
-                if is_better {
-                    best = Some((v, dex));
-                }
-            }
+    let valid = candidates
+        .into_iter()
+        .filter_map(|(result, dex)| match result {
+            Ok(v) if crate::evm::is_valid_quote(v) => Some((v, dex)),
             Ok(v) => {
-                // 报价为 0 意味着池子无流动性，视为无效结果
+                // 报价为 0 意味着池子无流动性，NaN/inf 为异常返回，均视为无效
                 warn!(
                     v,
                     dex = dex.as_str(),
                     label,
-                    "[EvmWatcher] DEX 报价为零，跳过"
+                    "[EvmWatcher] DEX 报价无效，跳过"
                 );
-                last_err = Some(format!("{dex}: 报价为零"));
+                None
             }
             Err(e) => {
                 warn!(error = %e, dex = dex.as_str(), label, "[EvmWatcher] DEX 报价失败");
-                last_err = Some(format!("{dex}: {e}"));
+                None
             }
-        }
-    }
-
-    best.ok_or_else(|| {
-        anyhow::anyhow!(
-            "所有 DEX {label} 报价均失败: {}",
-            last_err.unwrap_or_default()
-        )
-    })
+        });
+    let best = if prefer_max {
+        valid.max_by(|(a, _), (b, _)| a.total_cmp(b))
+    } else {
+        valid.min_by(|(a, _), (b, _)| a.total_cmp(b))
+    };
+    best.ok_or_else(|| anyhow::anyhow!("所有 DEX {label} 报价均失败"))
 }

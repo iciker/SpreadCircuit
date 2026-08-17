@@ -1,9 +1,8 @@
 /target
+/tests/
 /.cargo/
 /.github/workflows/
 /CHANGELOG.md
-/tests/
-/examples/
 .env*
 !.env_example
 *.db

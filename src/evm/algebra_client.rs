@@ -7,8 +7,8 @@ use alloy::{
 use anyhow::Result;
 
 use super::client::{
-    approve_if_needed, build_http_provider, from_bigint, parse_transfer_out, swap_deadline,
-    to_bigint, to_bigint_ceil, EthProvider, SwapOutcome, SwapRequest, TRANSFER_EVENT_MISSING,
+    build_http_provider, from_bigint, prepare_swap, settle_swap_receipt, swap_deadline, to_bigint,
+    EthProvider, SwapOutcome, SwapRequest,
 };
 
 // Algebra Integral AMM Quoter 接口
@@ -135,8 +135,7 @@ impl AlgebraQuoterClient {
 }
 
 /// KittenSwap（Algebra Integral AMM）交易执行函数
-/// 与 Uniswap V3 的 swap_exact_input_single 功能相同，但使用 Algebra Router 接口
-/// req.fee_tier 字段在 Algebra AMM 中不使用（由池内部决定）
+/// 与 Uniswap V3 的 swap_exact_input_single 区别仅在 Router 参数：无 fee 字段，有 deployer 字段
 /// nonce：调用方从链上 pending 状态显式获取，直接注入到 tx，绕过 alloy 本地缓存
 pub async fn algebra_swap_exact_input_single<T, P>(
     provider: &P,
@@ -147,18 +146,8 @@ where
     T: Transport + Clone,
     P: Provider<T>,
 {
-    let amount_in_raw = to_bigint(req.amount_in, req.decimals_in)?;
-    let amount_out_min_raw = to_bigint_ceil(req.amount_out_min, req.decimals_out)?;
-
-    let swap_nonce = approve_if_needed(
-        provider,
-        req.token_in,
-        req.recipient,
-        req.router,
-        amount_in_raw,
-        nonce,
-    )
-    .await?;
+    let (amount_in_raw, amount_out_min_raw, swap_nonce) =
+        prepare_swap(provider, req, nonce).await?;
 
     let params = IAlgebraRouter::ExactInputSingleParams {
         tokenIn: req.token_in,
@@ -171,8 +160,7 @@ where
         limitSqrtPrice: Uint::<160, 3>::ZERO,
     };
 
-    let router = IAlgebraRouter::new(req.router, provider);
-    let receipt = router
+    let receipt = IAlgebraRouter::new(req.router, provider)
         .exactInputSingle(params)
         .nonce(swap_nonce)
         .send()
@@ -180,29 +168,5 @@ where
         .get_receipt()
         .await?;
 
-    if !receipt.status() {
-        anyhow::bail!("kitten swap tx 回滚: {:?}", receipt.transaction_hash);
-    }
-
-    // 从 receipt 日志中解析实际成交的 token_out 数量
-    let actual_out = parse_transfer_out(receipt.inner.logs(), req.token_out, req.recipient)
-        .ok_or_else(|| {
-            tracing::error!(
-                tx_hash = %receipt.transaction_hash,
-                "[AlgebraClient] Transfer 事件未找到，链上已成功但实际金额未知"
-            );
-            anyhow::anyhow!("{TRANSFER_EVENT_MISSING}:{}", receipt.transaction_hash)
-        })?;
-
-    let amount_out = from_bigint(actual_out, req.decimals_out)?;
-    tracing::info!(
-        tx_hash = %receipt.transaction_hash,
-        amount_in = req.amount_in,
-        amount_out,
-        "[AlgebraClient] kitten swap 交易确认"
-    );
-    Ok(SwapOutcome {
-        amount_out,
-        tx_hash: receipt.transaction_hash.to_string(),
-    })
+    settle_swap_receipt(&receipt, req, "AlgebraClient")
 }

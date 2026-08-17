@@ -14,7 +14,9 @@ pub struct RecoveryRecord {
 }
 
 pub fn init(conn: &Connection) -> Result<()> {
-    conn.execute_batch("PRAGMA journal_mode = WAL;")?;
+    // busy_timeout：PriceDb 长连接与各 ArbEngine 恢复连接并发写同一库，
+    // WAL 下写者互斥；默认 0 会立即 SQLITE_BUSY，把瞬时锁冲突误升级为 RecoveryRequired
+    conn.execute_batch("PRAGMA journal_mode = WAL; PRAGMA busy_timeout = 5000;")?;
     conn.execute_batch(
         "
         CREATE TABLE IF NOT EXISTS prices (
@@ -46,14 +48,11 @@ pub fn init(conn: &Connection) -> Result<()> {
 
 pub fn prune_prices(conn: &Connection, max_rows: usize) -> Result<usize> {
     anyhow::ensure!(max_rows > 0, "max_rows 必须大于 0");
-    let count: usize = conn.query_row("SELECT COUNT(*) FROM prices", [], |row| row.get(0))?;
-    let excess = count.saturating_sub(max_rows);
-    if excess == 0 {
-        return Ok(0);
-    }
+    // id 单调递增：用 O(1) 水位线删除旧行，避免 COUNT(*) 全表扫描持有写锁。
+    // 历史裁剪留下的 id 空洞只会让保留行数 ≤ max_rows，方向安全。
     Ok(conn.execute(
-        "DELETE FROM prices WHERE id IN (SELECT id FROM prices ORDER BY id ASC LIMIT ?1)",
-        params![excess],
+        "DELETE FROM prices WHERE id <= (SELECT COALESCE(MAX(id), 0) FROM prices) - ?1",
+        params![max_rows as i64],
     )?)
 }
 
@@ -104,18 +103,12 @@ pub fn list_recoveries(conn: &Connection) -> Result<Vec<RecoveryRecord>> {
         .map_err(Into::into)
 }
 
-fn open_initialized(path: &str) -> Result<Connection> {
+/// 打开并初始化连接（WAL + busy_timeout + 建表）。ArbEngine 启动时调用一次并长期持有，
+/// 避免每次恢复持久化都重开连接、重跑 DDL。
+pub fn open_initialized(path: &str) -> Result<Connection> {
     let connection = Connection::open(path)?;
     init(&connection)?;
     Ok(connection)
-}
-
-pub fn upsert_recovery_at(path: &str, record: &RecoveryRecord) -> Result<()> {
-    upsert_recovery(&open_initialized(path)?, record)
-}
-
-pub fn clear_recovery_at(path: &str, pair: &str) -> Result<()> {
-    clear_recovery(&open_initialized(path)?, pair)
 }
 
 pub fn list_recoveries_at(path: &str) -> Result<Vec<RecoveryRecord>> {

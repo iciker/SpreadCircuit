@@ -35,182 +35,19 @@ Prometheus → Grafana：在 Grafana 中添加 Prometheus 数据源，地址填 
 | `arb_min_profit_bps` | GaugeVec | `pair` | 当前 `buy_diff` 动态经济下限（bps）；源码暂未单独暴露 sell 下限 |
 | `arb_trigger_total` | CounterVec | `direction=buy_diff\|sell_diff`, `pair` | 真实套利触发次数 |
 | `arb_dry_run_trigger_total` | CounterVec | `direction=buy_diff\|sell_diff`, `pair` | DRY_RUN 模式下满足条件的次数 |
-| `evm_swap_total` | CounterVec | `result=success\|failed`, `pair` | EVM Swap 成功/失败次数 |
+| `evm_swap_total` | CounterVec | `result=success\|failed\|aborted\|unknown`, `pair` | EVM Swap 结果统计（aborted=发送前安全放弃，unknown=超时/金额未知） |
 | `evm_requote_aborted_total` | CounterVec | `pair` | 执行前重新报价后因价格恶化而放弃、未发送链上交易的次数 |
-| `evm_swap_amount_out_total` | CounterVec | `pair` | 所有 Swap 的累计产出量（buy_diff → USDC，sell_diff → token1） |
+| `evm_swap_amount_out_total` | CounterVec | `direction=buy_diff\|sell_diff`, `pair` | 累计产出量（buy_diff → USDC，sell_diff → token1；单位不同勿跨 direction 聚合） |
+| `arb_recovery_required_total` | CounterVec | `pair` | 进入 RecoveryRequired 的次数——**应配置最高优先级告警（>0 即告警）** |
 | `liquid_order_total` | CounterVec | `result=filled\|resting\|failed`, `pair` | HL 限价单结果统计 |
 | `liquid_filled_size_total` | CounterVec | `pair` | HL 累计成交数量（token1） |
 | `arb_execution_duration_seconds` | HistogramVec | `pair` | 套利全链路耗时：EVM Swap 发出 → HL 结果返回 |
+| `evm_execution_gate_wait_seconds` | HistogramVec | `pair` | execution_gate 抢锁等待时间 |
 | `hl_orderbook_latency_ms` | GaugeVec | `pair` | HL 订单簿推送延迟（服务端时间 → 本地收到，ms） |
 
 ---
 
-## 三、推荐面板布局
-
-### Row 0：原始价格实时监控
-
-**Panel: EVM vs HL 双端价格走势（按 pair 分组）**
-- 类型：Time series
-- 用途：直观对比 EVM 和 HL 两端价格，判断价差是否来自真实市场机会，还是数据异常
-- PromQL（以 HYPE 为例）：
-  ```promql
-  evm_price_usdc{side="buy", pair="HYPE"}
-  evm_price_usdc{side="sell", pair="HYPE"}
-  hl_price_usdc{side="ask", pair="HYPE"}
-  hl_price_usdc{side="bid", pair="HYPE"}
-  ```
-- 建议：EVM buy/sell 用实线，HL ask/bid 用虚线，4 条线同图，Y 轴单位 `USDC`
-
-**Panel: EVM 最新区块号**
-- 类型：Stat
-- 用途：确认 EVM 数据实时性，区块号长时间不变说明 WS 断连
-- PromQL：
-  ```promql
-  evm_latest_block_number
-  ```
-- 建议：使用 `changes(evm_latest_block_number[1m])` 判断最近一分钟是否仍有新区块；区块号不是时间戳，不能用 `time() - block_number * 2` 估算延迟
-
----
-
-### Row 1：价差实时监控
-
-**Panel: 当前价差与 buy 阈值（按 pair 分组）**
-- 类型：Time series
-- 用途：判断市场是否有套利机会，以及距离触发阈值还差多远
-- PromQL（以 HYPE 为例）：
-  ```promql
-  arb_price_diff_bps{direction="buy", pair="HYPE"}
-  arb_price_diff_bps{direction="sell", pair="HYPE"}
-  arb_min_profit_bps{pair="HYPE"}
-  ```
-- 建议：三条线同图，阈值线用虚线样式，Y 轴单位 `bps`。当前指标只暴露 buy 方向经济下限，不能据此判断 sell 方向是否达到下限
-
----
-
-### Row 2：套利触发频率
-
-**Panel: 套利触发速率（5m，按 pair）**
-- 类型：Time series
-- 用途：观察各 pair BuyDiff / SellDiff 触发频率变化趋势
-- PromQL：
-  ```promql
-  rate(arb_trigger_total{direction="buy_diff"}[5m])
-  rate(arb_trigger_total{direction="sell_diff"}[5m])
-  ```
-  > 若多 pair 同图，用 `by (pair)` 聚合
-
-**Panel: DRY_RUN 触发速率（5m）**
-- 类型：Time series
-- 用途：DRY_RUN 阶段评估机会密度，对比真实触发
-- PromQL：
-  ```promql
-  rate(arb_dry_run_trigger_total{direction="buy_diff"}[5m])
-  rate(arb_dry_run_trigger_total{direction="sell_diff"}[5m])
-  ```
-
-**Panel: 套利触发总量（Stat）**
-- 类型：Stat（可拆分为 buy_diff / sell_diff 两个 panel）
-- PromQL：
-  ```promql
-  sum by (direction) (arb_trigger_total)
-  ```
-
----
-
-### Row 3：EVM Swap 执行
-
-**Panel: Swap 成功率（按 pair）**
-- 类型：Gauge（0-100%）
-- PromQL：
-  ```promql
-  sum by (pair) (rate(evm_swap_total{result="success"}[10m]))
-  /
-  sum by (pair) (rate(evm_swap_total[10m]))
-  * 100
-  ```
-
-**Panel: Swap 累计产出量**
-- 类型：Stat
-- 说明：buy_diff 方向产出 USDC，sell_diff 方向产出 token1，混合显示仅供参考
-- PromQL：
-  ```promql
-  evm_swap_amount_out_total
-  ```
-
-**Panel: Swap 成功/失败速率**
-- 类型：Time series
-- PromQL：
-  ```promql
-  rate(evm_swap_total{result="success"}[5m])
-  rate(evm_swap_total{result="failed"}[5m])
-  ```
-
-**Panel: Re-quote 放弃速率**
-- 类型：Time series
-- 用途：观察执行前真实金额重新报价后，因价格恶化而取消且未发送链上交易的频率
-- PromQL：
-  ```promql
-  rate(evm_requote_aborted_total[5m])
-  ```
-
----
-
-### Row 4：HyperLiquid 下单
-
-**Panel: HL 下单结果分布**
-- 类型：Bar chart 或 Time series
-- PromQL：
-  ```promql
-  rate(liquid_order_total{result="filled"}[10m])
-  rate(liquid_order_total{result="resting"}[10m])
-  rate(liquid_order_total{result="failed"}[10m])
-  ```
-- 健康状态：`filled` 率高、`resting` 偶发（挂单未成交需撤销）、`failed` 接近 0
-
-**Panel: HL 累计成交量**
-- 类型：Stat
-- PromQL：
-  ```promql
-  liquid_filled_size_total
-  ```
-
-**Panel: HL 下单成交率**
-- 类型：Gauge（0-100%）
-- PromQL：
-  ```promql
-  sum by (pair) (rate(liquid_order_total{result="filled"}[10m]))
-  /
-  sum by (pair) (rate(liquid_order_total[10m]))
-  * 100
-  ```
-
----
-
-### Row 5：延迟监控
-
-**Panel: 套利全链路耗时（P50 / P95 / P99，按 pair）**
-- 类型：Time series
-- 用途：判断 EVM Swap + HL 下单的端到端时间，评估是否在市场变化前完成
-- PromQL：
-  ```promql
-  histogram_quantile(0.50, sum by (pair, le) (rate(arb_execution_duration_seconds_bucket[5m])))
-  histogram_quantile(0.95, sum by (pair, le) (rate(arb_execution_duration_seconds_bucket[5m])))
-  histogram_quantile(0.99, sum by (pair, le) (rate(arb_execution_duration_seconds_bucket[5m])))
-  ```
-- 单位：seconds，建议告警：P95 > 5s 时触发
-
-**Panel: HL 订单簿推送延迟（按 pair）**
-- 类型：Time series 或 Stat
-- 用途：监控 WebSocket 连接质量，延迟高时价格数据已过时，套利判断可能失准
-- PromQL：
-  ```promql
-  hl_orderbook_latency_ms
-  ```
-- 单位：ms，建议告警：> 500ms 时触发
-
----
-
-## 四、告警规则建议
+## 三、告警规则建议
 
 ```yaml
 # prometheus-alerts.yml
@@ -283,7 +120,7 @@ groups:
 
 ---
 
-## 五、常见问题排查
+## 四、常见问题排查
 
 | 现象 | 先看这个指标 | 可能原因 |
 |------|-------------|---------|

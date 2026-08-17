@@ -114,16 +114,15 @@ impl OrderResult {
             total_size: None,
         }
     }
-
-    fn failed() -> Self {
-        Self::with_status(OrderStatus::Failed)
-    }
 }
 
 #[derive(Debug)]
 pub enum OrderStatus {
     Filled,
     Resting,
+    /// 交易所明确拒单：订单从未上簿，调用方可安全重试
+    Rejected,
+    /// 状态不明（响应缺 data / 未识别 status）：禁止重试
     Failed,
     Unknown,
 }
@@ -252,16 +251,28 @@ impl LiquidClient {
         match status {
             ExchangeResponseStatus::Ok(resp) => {
                 let Some(data) = resp.data else {
-                    return OrderResult::failed();
+                    return OrderResult::with_status(OrderStatus::Failed);
                 };
                 for s in data.statuses {
                     match s {
                         ExchangeDataStatus::Filled(f) => {
+                            let avg_price = f.avg_px.parse().ok();
+                            let total_size = f.total_sz.parse().ok();
+                            if avg_price.is_none() || total_size.is_none() {
+                                // 订单已真实成交，仅数值解析失败；下游会因字段缺失走恢复流程，
+                                // 必须留下原始值供人工核对，不能静默
+                                error!(
+                                    oid = f.oid,
+                                    avg_px = %f.avg_px,
+                                    total_sz = %f.total_sz,
+                                    "[LiquidClient] Filled 响应数值解析失败——对冲已成交但金额字段无法解析"
+                                );
+                            }
                             return OrderResult {
                                 status: OrderStatus::Filled,
                                 oid: Some(f.oid),
-                                avg_price: f.avg_px.parse().ok(),
-                                total_size: f.total_sz.parse().ok(),
+                                avg_price,
+                                total_size,
                             };
                         }
                         ExchangeDataStatus::Resting(r) => {
@@ -273,8 +284,8 @@ impl LiquidClient {
                             };
                         }
                         ExchangeDataStatus::Error(e) => {
-                            error!(error = %e, "[LiquidClient] order error");
-                            return OrderResult::failed();
+                            error!(error = %e, "[LiquidClient] order rejected by exchange");
+                            return OrderResult::with_status(OrderStatus::Rejected);
                         }
                         s => {
                             warn!("[LiquidClient] 收到未识别的 ExchangeDataStatus: {s:?}，跳过");
@@ -286,7 +297,7 @@ impl LiquidClient {
             }
             ExchangeResponseStatus::Err(e) => {
                 warn!(error = %e, "[LiquidClient] exchange error response");
-                OrderResult::failed()
+                OrderResult::with_status(OrderStatus::Rejected)
             }
         }
     }

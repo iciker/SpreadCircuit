@@ -6,7 +6,8 @@ use anyhow::{bail, ensure, Context, Result};
 const LIVE_TRADING_ACK: &str = "I_UNDERSTAND_THE_RISK";
 pub const HYPEREVM_USDC_ADDRESS: &str = "0xb8ce59fc3717ada4c02eadf9682a9e934f625ebb";
 
-/// 配置来源抽象。生产环境使用进程环境变量，其他调用方也可以提供受控配置源。
+/// 配置来源抽象。生产环境使用进程环境变量；测试注入受控配置源（env 是进程级全局，
+/// 并行测试直接改 env 会互相污染）。
 pub trait ConfigSource {
     fn get(&self, key: &str) -> Option<String>;
 }
@@ -43,9 +44,10 @@ pub struct Config {
     pub log_dir: String,
     pub db_path: String,
     pub db_max_price_rows: usize,
-    pairs: Vec<PairConfig>,
+    pub pairs: Vec<PairConfig>,
 }
 
+// 手写 Debug：脱敏私钥与 RPC URL 中的凭据，防止意外日志泄露（有测试覆盖）。
 impl std::fmt::Debug for Config {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("Config")
@@ -120,8 +122,16 @@ impl Config {
         Ok(config)
     }
 
-    pub fn pairs(&self) -> Vec<PairConfig> {
-        self.pairs.clone()
+    /// 把文本中出现的 RPC URL 替换为脱敏版本（URL path 常内嵌 API key，
+    /// transport 错误消息会原样携带），用于日志与持久化前的清洗。
+    pub fn redact_rpc(&self, text: &str) -> String {
+        let mut result = text.to_owned();
+        for url in [&self.https_rpc, &self.wss_rpc, &self.wss_api] {
+            if !url.is_empty() {
+                result = result.replace(url.as_str(), &redact_url(url));
+            }
+        }
+        result
     }
 
     fn validate_global(&self) -> Result<()> {
@@ -170,7 +180,7 @@ pub struct PairConfig {
 }
 
 impl PairConfig {
-    pub fn try_from_source_prefix(
+    fn try_from_source_prefix(
         source: &impl ConfigSource,
         prefix: &str,
         global: &Config,

@@ -6,6 +6,15 @@ use crate::{
     types::commands::{LiquidCommand, TradeResult},
 };
 
+/// 失败结果统一出口：埋点与结果构造成对出现，新增分支不会漏埋点
+fn fail(symbol: &str, reason: impl Into<String>, retriable: bool) -> TradeResult {
+    crate::metrics::record_liquid_order_failed(symbol);
+    TradeResult::LiquidFailed {
+        reason: reason.into(),
+        retriable,
+    }
+}
+
 pub async fn run(
     client: LiquidClient,
     symbol: String,
@@ -20,9 +29,8 @@ pub async fn run(
         .await
         {
             Ok(result) => result,
-            Err(_) => TradeResult::LiquidFailed {
-                reason: "HyperLiquid 请求超时".into(),
-            },
+            // 超时后订单状态不明，禁止重试
+            Err(_) => fail(&symbol, "HyperLiquid 请求超时", false),
         };
         if tx.send(result).await.is_err() {
             error!("[LiquidTrader] result channel closed");
@@ -48,10 +56,8 @@ async fn handle_command(client: &LiquidClient, symbol: &str, cmd: LiquidCommand)
                             symbol,
                             "[LiquidTrader] Filled 响应缺少 oid/avg_price/total_size"
                         );
-                        crate::metrics::record_liquid_order_failed(symbol);
-                        return TradeResult::LiquidFailed {
-                            reason: "filled response missing execution fields".into(),
-                        };
+                        // 订单已成交只是字段缺失，重试会双重对冲
+                        return fail(symbol, "filled response missing execution fields", false);
                     };
                     crate::metrics::record_liquid_order_filled(symbol, total_size);
                     TradeResult::LiquidFilled {
@@ -67,31 +73,26 @@ async fn handle_command(client: &LiquidClient, symbol: &str, cmd: LiquidCommand)
                     }
                     None => {
                         error!(symbol, "[LiquidTrader] Resting 但 oid 缺失，无法发起撤单");
-                        crate::metrics::record_liquid_order_failed(symbol);
-                        TradeResult::LiquidFailed {
-                            reason: "resting order missing oid".into(),
-                        }
+                        // 订单已上簿，重试会双重对冲
+                        fail(symbol, "resting order missing oid", false)
                     }
                 },
-                _ => {
-                    crate::metrics::record_liquid_order_failed(symbol);
-                    TradeResult::LiquidFailed {
-                        reason: "unknown status".into(),
-                    }
-                }
+                // 交易所明确拒单：订单从未上簿，允许调用方重试一次
+                OrderStatus::Rejected => fail(
+                    symbol,
+                    "exchange rejected order（详见 LiquidClient 日志）",
+                    true,
+                ),
+                // 状态不明：禁止重试
+                OrderStatus::Failed | OrderStatus::Unknown => fail(symbol, "unknown status", false),
             },
-            Err(e) => {
-                crate::metrics::record_liquid_order_failed(symbol);
-                TradeResult::LiquidFailed {
-                    reason: e.to_string(),
-                }
-            }
+            // 传输层错误，订单可能已被接收
+            Err(e) => fail(symbol, e.to_string(), false),
         },
         LiquidCommand::Cancel { oid } => match client.cancel_order(oid).await {
             Ok(_) => TradeResult::LiquidCancelled { oid },
-            Err(e) => TradeResult::LiquidFailed {
-                reason: e.to_string(),
-            },
+            // 撤单失败，resting 单状态不明
+            Err(e) => fail(symbol, e.to_string(), false),
         },
     }
 }

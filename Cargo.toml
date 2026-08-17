@@ -6,8 +6,15 @@ rust-version = "1.81"
 license = "AGPL-3.0-only"
 
 [dependencies]
-# EVM
-alloy = { version = "0.9", features = ["full"] }
+# EVM（按需 feature：contract 含 sol!/providers，ws 用于订阅新块，signer-local 签名）
+alloy = { version = "0.9", features = [
+    "contract",
+    "network",
+    "provider-http",
+    "provider-ws",
+    "rpc-types",
+    "signer-local",
+] }
 
 # HyperLiquid
 hyperliquid_rust_sdk = "0.6"
@@ -45,6 +52,5 @@ dotenvy = "0.15"
 anyhow = "1"
 
 # 监控
-lazy_static = "1"
 prometheus = { version = "0.13", features = ["process"] }
 axum = "0.7"

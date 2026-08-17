@@ -80,20 +80,23 @@ fn validate_economic_terms(
     profit_buffer_bps: f64,
     gas_cost_usdc: f64,
 ) -> anyhow::Result<()> {
-    for (name, value, positive) in [
-        (amount_name, amount, true),
-        ("worst_liquid_price", worst_liquid_price, true),
-        ("liquid_fee_bps", liquid_fee_bps, false),
-        ("profit_buffer_bps", profit_buffer_bps, false),
-        ("gas_cost_usdc", gas_cost_usdc, false),
-    ] {
-        anyhow::ensure!(
-            value.is_finite() && if positive { value > 0.0 } else { value >= 0.0 },
-            "{name} 数值无效"
-        );
-    }
-    anyhow::ensure!(liquid_fee_bps < BPS, "liquid_fee_bps 必须小于 10000");
-    anyhow::ensure!(profit_buffer_bps < BPS, "profit_buffer_bps 必须小于 10000");
+    anyhow::ensure!(amount.is_finite() && amount > 0.0, "{amount_name} 数值无效");
+    anyhow::ensure!(
+        worst_liquid_price.is_finite() && worst_liquid_price > 0.0,
+        "worst_liquid_price 数值无效"
+    );
+    anyhow::ensure!(
+        liquid_fee_bps.is_finite() && (0.0..BPS).contains(&liquid_fee_bps),
+        "liquid_fee_bps 必须位于 [0, 10000)"
+    );
+    anyhow::ensure!(
+        profit_buffer_bps.is_finite() && (0.0..BPS).contains(&profit_buffer_bps),
+        "profit_buffer_bps 必须位于 [0, 10000)"
+    );
+    anyhow::ensure!(
+        gas_cost_usdc.is_finite() && gas_cost_usdc >= 0.0,
+        "gas_cost_usdc 数值无效"
+    );
     Ok(())
 }
 
@@ -155,21 +158,15 @@ impl TradePlan {
     }
 }
 
-struct OpportunityEvaluation {
-    evm_buy: f64,
-    evm_sell: f64,
-    liquid_ask: f64,
-    liquid_bid: f64,
-    buy: TradePlan,
-    sell: TradePlan,
-}
-
+/// 第二腿定价管线：最坏可成交价（含滑点偏移）→ 按市场精度归一化。
+/// 机会评估与实际对冲下单共用这一条管线，避免两处定价规则漂移。
 fn normalized_worst_liquid_price(
     direction: ArbDirection,
     order_book: &OrderBook,
     pair: &PairConfig,
+    size: f64,
     size_decimals: u8,
-) -> anyhow::Result<f64> {
+) -> anyhow::Result<crate::liquid::client::NormalizedSpotOrder> {
     let is_buy = matches!(direction, ArbDirection::BuyDiff);
     let price = worst_case_liquid_price(
         direction,
@@ -177,7 +174,7 @@ fn normalized_worst_liquid_price(
         order_book.ask,
         pair.limit_slippage,
     )?;
-    Ok(normalize_spot_order(is_buy, price, pair.order_size_token1, size_decimals)?.price)
+    normalize_spot_order(is_buy, price, size, size_decimals)
 }
 
 fn evaluate_opportunities(
@@ -186,7 +183,7 @@ fn evaluate_opportunities(
     liquid_rules: &LiquidMarketRules,
     evm: &EvmPrice,
     order_book: &OrderBook,
-) -> anyhow::Result<OpportunityEvaluation> {
+) -> anyhow::Result<(TradePlan, TradePlan)> {
     let prices = [
         evm.sell_price,
         evm.buy_price,
@@ -208,16 +205,20 @@ fn evaluate_opportunities(
         ArbDirection::BuyDiff,
         order_book,
         pair,
+        size,
         liquid_rules.size_decimals,
     )
-    .context("buy_diff HL 最坏价格无效")?;
+    .context("buy_diff HL 最坏价格无效")?
+    .price;
     let sell_worst_price = normalized_worst_liquid_price(
         ArbDirection::SellDiff,
         order_book,
         pair,
+        size,
         liquid_rules.size_decimals,
     )
-    .context("sell_diff HL 最坏价格无效")?;
+    .context("sell_diff HL 最坏价格无效")?
+    .price;
 
     let sell_amount_in = size * evm.buy_price;
     let buy_target = minimum_buy_evm_output(
@@ -244,12 +245,8 @@ fn evaluate_opportunities(
         / (size * (1.0 + global.profit_buffer_bps / BPS));
     let sell_economic_bps = (order_book.bid - maximum_evm_buy_price) / order_book.bid * BPS;
 
-    Ok(OpportunityEvaluation {
-        evm_buy: evm.buy_price,
-        evm_sell: evm.sell_price,
-        liquid_ask: order_book.ask,
-        liquid_bid: order_book.bid,
-        buy: TradePlan {
+    Ok((
+        TradePlan {
             direction: ArbDirection::BuyDiff,
             diff_bps: buy_diff,
             minimum_diff_bps: pair.ask_diff_percent.max(buy_economic_bps),
@@ -259,7 +256,7 @@ fn evaluate_opportunities(
             enabled: true,
             economically_safe: size * evm.sell_price >= buy_target,
         },
-        sell: TradePlan {
+        TradePlan {
             direction: ArbDirection::SellDiff,
             diff_bps: sell_diff,
             minimum_diff_bps: pair.bid_diff_percent.max(sell_economic_bps),
@@ -269,7 +266,7 @@ fn evaluate_opportunities(
             enabled: pair.enable_sell_arb,
             economically_safe: size >= sell_target,
         },
-    })
+    ))
 }
 
 /// 计算第二条腿需要对冲的 token1 数量。
@@ -296,6 +293,11 @@ pub fn fill_is_complete(expected: f64, actual: f64) -> bool {
     actual + tolerance >= expected
 }
 
+/// 单时间戳新鲜度：非未来时间且年龄不超过 max_age_ms
+pub fn timestamp_is_fresh(timestamp: u64, now: u64, max_age_ms: u64) -> bool {
+    timestamp <= now && now - timestamp <= max_age_ms
+}
+
 pub fn market_data_is_fresh(
     evm_received_at: u64,
     orderbook_received_at: u64,
@@ -303,26 +305,49 @@ pub fn market_data_is_fresh(
     max_age_ms: u64,
     max_skew_ms: u64,
 ) -> bool {
-    if evm_received_at > now || orderbook_received_at > now {
-        return false;
+    timestamp_is_fresh(evm_received_at, now, max_age_ms)
+        && timestamp_is_fresh(orderbook_received_at, now, max_age_ms)
+        && evm_received_at.abs_diff(orderbook_received_at) <= max_skew_ms
+}
+
+/// 一个在途套利周期的全部状态：与周期同生共死，
+/// 触发时整体创建、终态（完成/恢复）时整体清除，杜绝平行可空字段漂移。
+struct InFlightCycle {
+    dir: ArbDirection,
+    started_at: Instant,
+    /// HL 下单后期望的完整成交数量（下单前为 None）
+    expected_liquid_size: Option<f64>,
+    /// EVM 第一腿的实际 amount_out（TransferEventMissing 时为 None），
+    /// 供 HL 拒单重试时重算对冲数量
+    evm_amount_out: Option<f64>,
+    /// 每个周期最多允许一次 HL 拒单重试
+    liquid_retry_used: bool,
+}
+
+impl InFlightCycle {
+    fn new(dir: ArbDirection) -> Self {
+        Self {
+            dir,
+            started_at: Instant::now(),
+            expected_liquid_size: None,
+            evm_amount_out: None,
+            liquid_retry_used: false,
+        }
     }
-    let evm_age = now - evm_received_at;
-    let orderbook_age = now - orderbook_received_at;
-    let skew = evm_received_at.abs_diff(orderbook_received_at);
-    evm_age <= max_age_ms && orderbook_age <= max_age_ms && skew <= max_skew_ms
 }
 
 pub struct ArbEngine {
     global: Arc<Config>,
     pair: Arc<PairConfig>,
     state: ArbState,
-    pending_dir: Option<ArbDirection>,
+    /// Some ⟺ 存在在途周期（EvmSwapping/LiquidOrdering）
+    cycle: Option<InFlightCycle>,
     last_evm_price: Option<EvmPrice>,
     last_order_book: Option<OrderBook>,
-    arb_start: Option<Instant>,
-    expected_liquid_size: Option<f64>,
     liquid_rules: LiquidMarketRules,
     recovery_record: Option<RecoveryRecord>,
+    /// 恢复记录专用长连接：避免每次持久化重开连接、重跑 DDL 并加剧写锁竞争
+    recovery_conn: rusqlite::Connection,
 
     evm_rx: broadcast::Receiver<EvmPrice>,
     ob_rx: broadcast::Receiver<OrderBook>,
@@ -345,25 +370,25 @@ impl ArbEngine {
         result_rx: mpsc::Receiver<TradeResult>,
         db_tx: broadcast::Sender<PriceRecord>,
         liquid_rules: LiquidMarketRules,
-    ) -> Self {
-        Self {
+    ) -> anyhow::Result<Self> {
+        let recovery_conn = db::open_initialized(&global.db_path)?;
+        Ok(Self {
             global,
             pair,
             state: ArbState::Idle,
-            pending_dir: None,
+            cycle: None,
             last_evm_price: None,
             last_order_book: None,
-            arb_start: None,
-            expected_liquid_size: None,
             liquid_rules,
             recovery_record: None,
+            recovery_conn,
             evm_rx,
             ob_rx,
             evm_tx,
             liquid_tx,
             result_rx,
             db_tx,
-        }
+        })
     }
 
     pub async fn run(mut self, shutdown: CancellationToken) {
@@ -372,8 +397,11 @@ impl ArbEngine {
             if stopping && matches!(self.state, ArbState::Idle | ArbState::RecoveryRequired) {
                 break;
             }
+            // 注意：evm_rx/ob_rx 在 stopping 期间保持消费——在途第一腿确认后仍需要
+            // 新鲜订单簿完成对冲（OrderBookWatcher 会等所有引擎退出后才停止推送）。
+            // 不接新机会由循环顶部的 Idle 退出条件保证。
             tokio::select! {
-                result = self.evm_rx.recv(), if !stopping => match result {
+                result = self.evm_rx.recv() => match result {
                     Ok(price) if price.pair_id == self.pair.symbol => {
                         self.last_evm_price = Some(price);
                         self.try_arb().await;
@@ -388,7 +416,7 @@ impl ArbEngine {
                         break;
                     }
                 },
-                result = self.ob_rx.recv(), if !stopping => match result {
+                result = self.ob_rx.recv() => match result {
                     Ok(ob) if ob.symbol == self.pair.symbol => {
                         if ob.created_at > 0 {
                             let latency_ms = ob.received_at.saturating_sub(ob.created_at) as f64;
@@ -448,14 +476,14 @@ impl ArbEngine {
             return;
         }
 
-        let evaluation = match evaluate_opportunities(
+        let (buy_plan, sell_plan) = match evaluate_opportunities(
             &self.global,
             &self.pair,
             &self.liquid_rules,
             evm,
             order_book,
         ) {
-            Ok(evaluation) => evaluation,
+            Ok(plans) => plans,
             Err(error) => {
                 warn!(error = %error, symbol = %self.pair.symbol, "[ArbEngine] 套利机会计算失败，跳过");
                 return;
@@ -463,49 +491,46 @@ impl ArbEngine {
         };
 
         info!(
-            buy_diff = evaluation.buy.diff_bps,
-            sell_diff = evaluation.sell.diff_bps,
-            min_bps = evaluation.buy.minimum_diff_bps,
-            sell_min_bps = evaluation.sell.minimum_diff_bps,
-            sell_dex = %evaluation.buy.dex,
-            buy_dex = %evaluation.sell.dex,
+            buy_diff = buy_plan.diff_bps,
+            sell_diff = sell_plan.diff_bps,
+            min_bps = buy_plan.minimum_diff_bps,
+            sell_min_bps = sell_plan.minimum_diff_bps,
+            sell_dex = %buy_plan.dex,
+            buy_dex = %sell_plan.dex,
             symbol = %self.pair.symbol,
             "[ArbEngine] 检测差价"
         );
 
         crate::metrics::record_price_diff(
             &self.pair.symbol,
-            evaluation.buy.diff_bps,
-            evaluation.sell.diff_bps,
-            evaluation.buy.minimum_diff_bps,
+            buy_plan.diff_bps,
+            sell_plan.diff_bps,
+            buy_plan.minimum_diff_bps,
         );
-        crate::metrics::record_hl_price(
-            &self.pair.symbol,
-            evaluation.liquid_ask,
-            evaluation.liquid_bid,
-        );
+        crate::metrics::record_hl_price(&self.pair.symbol, order_book.ask, order_book.bid);
 
         if self
             .db_tx
             .send(PriceRecord {
                 pair: self.pair.symbol.clone(),
-                evm_buy_price: evaluation.evm_buy,
-                evm_sell_price: evaluation.evm_sell,
-                liquid_ask: evaluation.liquid_ask,
-                liquid_bid: evaluation.liquid_bid,
-                sell_diff: evaluation.sell.diff_bps,
-                buy_diff: evaluation.buy.diff_bps,
+                evm_buy_price: evm.buy_price,
+                evm_sell_price: evm.sell_price,
+                liquid_ask: order_book.ask,
+                liquid_bid: order_book.bid,
+                sell_diff: sell_plan.diff_bps,
+                buy_diff: buy_plan.diff_bps,
             })
             .is_err()
         {
             warn!("[ArbEngine] db_tx 已关闭，价格记录丢失");
         }
 
-        if self.global.dry_run {
-            for plan in [evaluation.buy, evaluation.sell]
-                .into_iter()
-                .filter(|plan| plan.is_triggered())
-            {
+        // dry_run 记录所有满足条件的方向；实盘只执行第一个触发的方向
+        for plan in [buy_plan, sell_plan]
+            .into_iter()
+            .filter(|plan| plan.is_triggered())
+        {
+            if self.global.dry_run {
                 info!(
                     direction = plan.direction.label(),
                     diff_bps = plan.diff_bps,
@@ -518,14 +543,8 @@ impl ArbEngine {
                     &self.pair.symbol,
                     plan.direction.label(),
                 );
+                continue;
             }
-            return;
-        }
-
-        if let Some(plan) = [evaluation.buy, evaluation.sell]
-            .into_iter()
-            .find(|plan| plan.is_triggered())
-        {
             info!(
                 direction = plan.direction.label(),
                 diff_bps = plan.diff_bps,
@@ -537,6 +556,7 @@ impl ArbEngine {
             );
             self.send_evm_swap(plan.direction, plan.amount_in, plan.target_amount, plan.dex)
                 .await;
+            return;
         }
     }
 
@@ -550,8 +570,7 @@ impl ArbEngine {
         // is_buy 从 dir 推导，消除调用方传入冗余 bool 的风险
         let is_buy = matches!(dir, ArbDirection::SellDiff);
         crate::metrics::record_arb_triggered(&self.pair.symbol, dir.label());
-        self.pending_dir = Some(dir);
-        self.arb_start = Some(Instant::now());
+        self.cycle = Some(InFlightCycle::new(dir));
         if let Err(error) = self.persist_stage("evm_pending", "等待 EVM 执行", None, None) {
             self.require_recovery(&format!("无法持久化 EVM 待执行状态: {error}"));
             return;
@@ -581,36 +600,41 @@ impl ArbEngine {
         liquid_oid: Option<u64>,
     ) -> anyhow::Result<()> {
         let direction = self
-            .pending_dir
-            .map(ArbDirection::label)
+            .cycle
+            .as_ref()
+            .map(|cycle| cycle.dir.label())
             .unwrap_or("unknown")
             .to_owned();
-        let mut record = self.recovery_record.clone().unwrap_or(RecoveryRecord {
+        let prev = self.recovery_record.as_ref();
+        let record = RecoveryRecord {
             pair: self.pair.symbol.clone(),
             stage: stage.to_owned(),
-            direction: direction.clone(),
-            evm_tx_hash: None,
-            liquid_oid: None,
-            reason: reason.to_owned(),
-        });
-        record.stage = stage.to_owned();
-        record.direction = direction;
-        record.reason = reason.to_owned();
-        if evm_tx_hash.is_some() {
-            record.evm_tx_hash = evm_tx_hash;
-        }
-        if liquid_oid.is_some() {
-            record.liquid_oid = liquid_oid;
-        }
-        db::upsert_recovery_at(&self.global.db_path, &record)?;
+            direction,
+            evm_tx_hash: evm_tx_hash.or_else(|| prev.and_then(|r| r.evm_tx_hash.clone())),
+            liquid_oid: liquid_oid.or_else(|| prev.and_then(|r| r.liquid_oid)),
+            // reason 可能内嵌 RPC 错误（含带凭据的 URL），持久化边界统一脱敏
+            reason: self.global.redact_rpc(reason),
+        };
+        // busy_timeout 下同步 SQLite 写最长可阻塞 5s，避免钉死 tokio worker
+        tokio::task::block_in_place(|| db::upsert_recovery(&self.recovery_conn, &record))?;
         self.recovery_record = Some(record);
         Ok(())
     }
 
     fn clear_persisted_cycle(&mut self) -> anyhow::Result<()> {
-        db::clear_recovery_at(&self.global.db_path, &self.pair.symbol)?;
+        tokio::task::block_in_place(|| db::clear_recovery(&self.recovery_conn, &self.pair.symbol))?;
         self.recovery_record = None;
         Ok(())
+    }
+
+    /// 上报本周期耗时（每个周期只在终态调用一次；cycle 随后被清除，不会重复上报）
+    fn record_cycle_duration(&self) {
+        if let Some(cycle) = &self.cycle {
+            crate::metrics::record_arb_execution_duration(
+                &self.pair.symbol,
+                cycle.started_at.elapsed().as_secs_f64(),
+            );
+        }
     }
 
     /// 记录套利耗时并复位状态机到 Idle
@@ -619,28 +643,20 @@ impl ArbEngine {
             self.require_recovery(&format!("清除已完成交易的恢复记录失败: {error}"));
             return;
         }
-        if let Some(start) = self.arb_start.take() {
-            crate::metrics::record_arb_execution_duration(
-                &self.pair.symbol,
-                start.elapsed().as_secs_f64(),
-            );
-        }
+        self.record_cycle_duration();
         self.state = ArbState::Idle;
-        self.pending_dir = None;
-        self.expected_liquid_size = None;
+        self.cycle = None;
     }
 
     fn require_recovery(&mut self, reason: &str) {
-        if let Some(start) = self.arb_start.take() {
-            crate::metrics::record_arb_execution_duration(
-                &self.pair.symbol,
-                start.elapsed().as_secs_f64(),
-            );
-        }
+        self.record_cycle_duration();
+        crate::metrics::record_arb_recovery_required(&self.pair.symbol);
         self.state = ArbState::RecoveryRequired;
+        // persist_stage 从 cycle 读取方向，须在清除 cycle 之前调用
         if let Err(error) = self.persist_stage("recovery_required", reason, None, None) {
             error!(error = %error, "[ArbEngine] RecoveryRequired 持久化失败");
         }
+        self.cycle = None;
         error!(
             symbol = %self.pair.symbol,
             reason,
@@ -648,13 +664,15 @@ impl ArbEngine {
         );
     }
 
-    /// 从 pending_dir 和当前 orderbook 推导 HL 限价单方向，发出 LiquidOrder
-    async fn proceed_to_liquid_order(&mut self, context: &str, evm_amount_out: Option<f64>) {
-        let dir = match self.pending_dir {
-            Some(d) => d,
+    /// 从在途周期和当前 orderbook 推导 HL 限价单方向，发出 LiquidOrder。
+    /// 对冲数量来源于 cycle.evm_amount_out（EVM 第一腿实际产出）。
+    async fn proceed_to_liquid_order(&mut self, context: &str) {
+        let (dir, evm_amount_out) = match &self.cycle {
+            Some(cycle) => (cycle.dir, cycle.evm_amount_out),
             None => {
-                error!("[ArbEngine] 状态机错误: {context} 下 pending_dir 为空，复位");
-                self.finish_arb_cycle();
+                // EVM 第一腿已成功、周期状态却丢失——状态机异常且资金已划转，
+                // 必须人工介入而非静默复位
+                self.require_recovery(&format!("{context} 下无在途周期，状态机异常"));
                 return;
             }
         };
@@ -663,8 +681,7 @@ impl ArbEngine {
             self.require_recovery(&format!("{context}: order_book 为空"));
             return;
         };
-        let now = unix_timestamp_ms();
-        if ob.received_at > now || now - ob.received_at > MAX_MARKET_AGE_MS {
+        if !timestamp_is_fresh(ob.received_at, unix_timestamp_ms(), MAX_MARKET_AGE_MS) {
             self.require_recovery(&format!("{context}: order_book 已过期"));
             return;
         }
@@ -672,14 +689,6 @@ impl ArbEngine {
         // buy_diff: 已在 EVM 卖出 token1，现在在 HL 买入补仓
         // sell_diff: 已在 EVM 买入 token1，现在在 HL 卖出套现
         let is_buy = matches!(dir, ArbDirection::BuyDiff);
-        let raw_price = match worst_case_liquid_price(dir, ob.bid, ob.ask, self.pair.limit_slippage)
-        {
-            Ok(price) => price,
-            Err(error) => {
-                self.require_recovery(&format!("{context}: {error}"));
-                return;
-            }
-        };
         let size = match hedge_size_token1(dir, self.pair.order_size_token1, evm_amount_out) {
             Ok(size) => size,
             Err(error) => {
@@ -687,14 +696,19 @@ impl ArbEngine {
                 return;
             }
         };
-        let normalized =
-            match normalize_spot_order(is_buy, raw_price, size, self.liquid_rules.size_decimals) {
-                Ok(order) => order,
-                Err(error) => {
-                    self.require_recovery(&format!("{context}: {error}"));
-                    return;
-                }
-            };
+        let normalized = match normalized_worst_liquid_price(
+            dir,
+            ob,
+            &self.pair,
+            size,
+            self.liquid_rules.size_decimals,
+        ) {
+            Ok(order) => order,
+            Err(error) => {
+                self.require_recovery(&format!("{context}: {error}"));
+                return;
+            }
+        };
         let price = normalized.price;
         let size = normalized.size;
 
@@ -702,7 +716,9 @@ impl ArbEngine {
             error!(error = %error, "[ArbEngine] Liquid 待执行状态持久化失败，继续优先完成对冲");
         }
         self.state = ArbState::LiquidOrdering;
-        self.expected_liquid_size = Some(size);
+        if let Some(cycle) = self.cycle.as_mut() {
+            cycle.expected_liquid_size = Some(size);
+        }
         if let Err(e) = self
             .liquid_tx
             .send(LiquidCommand::Order {
@@ -738,37 +754,39 @@ impl ArbEngine {
                 ) {
                     error!(error = %error, "[ArbEngine] EVM 确认状态持久化失败，继续优先完成对冲");
                 }
-                self.proceed_to_liquid_order("EvmSwapSuccess", Some(*amount_out))
-                    .await;
+                if let Some(cycle) = self.cycle.as_mut() {
+                    cycle.evm_amount_out = Some(*amount_out);
+                }
+                self.proceed_to_liquid_order("EvmSwapSuccess").await;
                 return;
             }
-            (ArbState::EvmSwapping, TradeResult::EvmSwapFailed { reason })
-                if reason.starts_with(crate::evm::client::TRANSFER_EVENT_MISSING) =>
-            {
+            (ArbState::EvmSwapping, TradeResult::EvmSwapAborted { reason }) => {
+                // 发送 tx 之前的安全放弃：链上零资金变动，直接复位等下一轮
+                warn!(reason, "[ArbEngine] EVM 发送前安全放弃本轮");
+            }
+            (ArbState::EvmSwapping, TradeResult::EvmSwapConfirmedAmountUnknown { tx_hash }) => {
                 // 链上已成功但 Transfer 事件缺失：资金已划转，不可重试
                 error!(
-                    reason,
+                    tx_hash,
                     "[ArbEngine] EVM swap 链上完成但金额未知，继续 Liquid 下单"
                 );
-                if let Some((_, tx_hash)) = reason.split_once(':') {
-                    let _ = self.persist_stage(
-                        "evm_confirmed_amount_unknown",
-                        reason,
-                        Some(tx_hash.to_owned()),
-                        None,
-                    );
+                if let Err(error) = self.persist_stage(
+                    "evm_confirmed_amount_unknown",
+                    "EVM 已确认但实际金额未知",
+                    Some(tx_hash.clone()),
+                    None,
+                ) {
+                    error!(error = %error, "[ArbEngine] 金额未知状态持久化失败，继续优先完成对冲");
                 }
-                self.proceed_to_liquid_order("TransferEventMissing", None)
-                    .await;
+                // cycle.evm_amount_out 保持 None：金额未知，SellDiff 会在
+                // hedge_size_token1 处拒绝猜测并进入恢复
+                self.proceed_to_liquid_order("TransferEventMissing").await;
                 return;
             }
             (ArbState::EvmSwapping, TradeResult::EvmSwapFailed { reason }) => {
-                if reason.starts_with(super::evm_trader::PRICE_DETERIORATED) {
-                    warn!(reason, "[ArbEngine] EVM 价格恶化，安全放弃本轮");
-                } else {
-                    self.require_recovery(reason);
-                    return;
-                }
+                // 发送阶段的失败（approve/swap tx 回滚、回执错误）：状态不明，fail-closed
+                self.require_recovery(reason);
+                return;
             }
             (ArbState::EvmSwapping, TradeResult::EvmSwapUnknown { reason }) => {
                 self.require_recovery(reason);
@@ -791,7 +809,12 @@ impl ArbEngine {
                 {
                     error!(error = %error, "[ArbEngine] HL 成交状态持久化失败");
                 }
-                let expected = self.expected_liquid_size.unwrap_or_default();
+                let Some(expected) = self.cycle.as_ref().and_then(|c| c.expected_liquid_size)
+                else {
+                    // 不能用 0.0 兜底：那会把任意成交量误判为完整对冲
+                    self.require_recovery("expected_liquid_size 缺失，状态机异常");
+                    return;
+                };
                 if !fill_is_complete(expected, *total_size) {
                     self.require_recovery("Liquid 仅部分成交");
                     return;
@@ -825,7 +848,21 @@ impl ArbEngine {
                 self.require_recovery("Liquid 挂单撤销后仍有未对冲仓位");
                 return;
             }
-            (ArbState::LiquidOrdering, TradeResult::LiquidFailed { reason }) => {
+            (ArbState::LiquidOrdering, TradeResult::LiquidFailed { reason, retriable }) => {
+                // 仅交易所明确拒单（订单从未上簿）允许用最新订单簿重试一次；
+                // 传输错误/超时下订单状态不明，重试会有双重对冲风险
+                let retry_available = self
+                    .cycle
+                    .as_ref()
+                    .is_some_and(|cycle| !cycle.liquid_retry_used);
+                if *retriable && retry_available {
+                    if let Some(cycle) = self.cycle.as_mut() {
+                        cycle.liquid_retry_used = true;
+                    }
+                    warn!(reason, "[ArbEngine] HL 明确拒单，用最新订单簿重试一次");
+                    self.proceed_to_liquid_order("LiquidRetry").await;
+                    return;
+                }
                 error!(reason, "[ArbEngine] Liquid 下单失败");
                 self.require_recovery(reason);
                 return;

@@ -1,123 +1,171 @@
-use lazy_static::lazy_static;
+use std::sync::LazyLock;
+
 use prometheus::{
     register_counter_vec, register_gauge, register_gauge_vec, register_histogram_vec, CounterVec,
     Encoder, Gauge, GaugeVec, HistogramVec, TextEncoder,
 };
 
-lazy_static! {
-    // ── 价差 ──────────────────────────────────────────────────────────────
-    static ref PRICE_DIFF_BPS: GaugeVec = register_gauge_vec!(
+// ── 价差 ──────────────────────────────────────────────────────────────────
+static PRICE_DIFF_BPS: LazyLock<GaugeVec> = LazyLock::new(|| {
+    register_gauge_vec!(
         "arb_price_diff_bps",
         "Current arbitrage price diff in bps",
         &["direction", "pair"]
-    ).unwrap();
+    )
+    .unwrap()
+});
 
-    static ref MIN_PROFIT_BPS: GaugeVec = register_gauge_vec!(
+static MIN_PROFIT_BPS: LazyLock<GaugeVec> = LazyLock::new(|| {
+    register_gauge_vec!(
         "arb_min_profit_bps",
         "Current minimum profit threshold in bps",
         &["pair"]
-    ).unwrap();
+    )
+    .unwrap()
+});
 
-    // ── 套利触发 ──────────────────────────────────────────────────────────
-    static ref ARB_TRIGGER_TOTAL: CounterVec = register_counter_vec!(
+// ── 套利触发 ──────────────────────────────────────────────────────────────
+static ARB_TRIGGER_TOTAL: LazyLock<CounterVec> = LazyLock::new(|| {
+    register_counter_vec!(
         "arb_trigger_total",
         "Total arbitrage triggers that sent a real trade",
         &["direction", "pair"]
-    ).unwrap();
+    )
+    .unwrap()
+});
 
-    static ref ARB_DRY_RUN_TRIGGER_TOTAL: CounterVec = register_counter_vec!(
+static ARB_DRY_RUN_TRIGGER_TOTAL: LazyLock<CounterVec> = LazyLock::new(|| {
+    register_counter_vec!(
         "arb_dry_run_trigger_total",
         "Arbitrage condition met count in dry-run mode",
         &["direction", "pair"]
-    ).unwrap();
+    )
+    .unwrap()
+});
 
-    // ── EVM Swap ──────────────────────────────────────────────────────────
-    static ref EVM_SWAP_TOTAL: CounterVec = register_counter_vec!(
+// ── EVM Swap ──────────────────────────────────────────────────────────────
+static EVM_SWAP_TOTAL: LazyLock<CounterVec> = LazyLock::new(|| {
+    register_counter_vec!(
         "evm_swap_total",
         "Total EVM swap attempts by result",
         &["result", "pair"]
-    ).unwrap();
+    )
+    .unwrap()
+});
 
-    /// 执行前实时报价后因价格恶化而放弃的次数（未发送链上 tx）
-    static ref REQUOTE_ABORTED_TOTAL: CounterVec = register_counter_vec!(
+/// 执行前实时报价后因价格恶化而放弃的次数（未发送链上 tx）
+static REQUOTE_ABORTED_TOTAL: LazyLock<CounterVec> = LazyLock::new(|| {
+    register_counter_vec!(
         "evm_requote_aborted_total",
         "Swaps aborted after re-quote because price deteriorated below target",
         &["pair"]
-    ).unwrap();
+    )
+    .unwrap()
+});
 
-    static ref EVM_SWAP_AMOUNT_OUT_TOTAL: CounterVec = register_counter_vec!(
+static EVM_SWAP_AMOUNT_OUT_TOTAL: LazyLock<CounterVec> = LazyLock::new(|| {
+    register_counter_vec!(
         "evm_swap_amount_out_total",
-        "Total token amount received from all EVM swaps (USDC for buy_diff, token1 for sell_diff)",
-        &["pair"]
-    ).unwrap();
+        "Total token amount received from all EVM swaps (buy_diff: USDC, sell_diff: token1; 单位不同，勿跨 direction 聚合)",
+        &["direction", "pair"]
+    )
+    .unwrap()
+});
 
-    // ── Liquid 订单 ───────────────────────────────────────────────────────
-    static ref LIQUID_ORDER_TOTAL: CounterVec = register_counter_vec!(
+/// 进入 RecoveryRequired 的次数——最关键的人工介入告警信号
+static ARB_RECOVERY_REQUIRED_TOTAL: LazyLock<CounterVec> = LazyLock::new(|| {
+    register_counter_vec!(
+        "arb_recovery_required_total",
+        "Times a pair entered RecoveryRequired and stopped trading (requires manual intervention)",
+        &["pair"]
+    )
+    .unwrap()
+});
+
+// ── Liquid 订单 ───────────────────────────────────────────────────────────
+static LIQUID_ORDER_TOTAL: LazyLock<CounterVec> = LazyLock::new(|| {
+    register_counter_vec!(
         "liquid_order_total",
         "Total Liquid order attempts by result",
         &["result", "pair"]
-    ).unwrap();
+    )
+    .unwrap()
+});
 
-    static ref LIQUID_FILLED_SIZE_TOTAL: CounterVec = register_counter_vec!(
+static LIQUID_FILLED_SIZE_TOTAL: LazyLock<CounterVec> = LazyLock::new(|| {
+    register_counter_vec!(
         "liquid_filled_size_total",
         "Total filled size across all Liquid orders",
         &["pair"]
-    ).unwrap();
+    )
+    .unwrap()
+});
 
-    // ── 延迟 ──────────────────────────────────────────────────────────────
-    /// 套利全链路耗时（触发 EvmSwap → 收到 Liquid 结果），秒，按 pair 分维度
-    static ref ARB_EXECUTION_DURATION: HistogramVec = register_histogram_vec!(
+// ── 延迟 ──────────────────────────────────────────────────────────────────
+/// 套利全链路耗时（触发 EvmSwap → 收到 Liquid 结果），秒，按 pair 分维度
+static ARB_EXECUTION_DURATION: LazyLock<HistogramVec> = LazyLock::new(|| {
+    register_histogram_vec!(
         "arb_execution_duration_seconds",
         "End-to-end arb cycle time: from EVM swap trigger to liquid order result",
         &["pair"],
         vec![0.1, 0.5, 1.0, 2.0, 3.0, 5.0, 10.0, 20.0, 30.0]
-    ).unwrap();
+    )
+    .unwrap()
+});
 
-    /// HyperLiquid l2Book 推送延迟（服务端时间戳 → 本地收到，ms），按 pair 分维度
-    static ref HL_ORDERBOOK_LATENCY_MS: GaugeVec = register_gauge_vec!(
+/// execution_gate 抢锁等待时间，按 pair 分维度
+static EXECUTION_GATE_WAIT: LazyLock<HistogramVec> = LazyLock::new(|| {
+    register_histogram_vec!(
+        "evm_execution_gate_wait_seconds",
+        "Time spent waiting to acquire the shared EVM execution gate before a swap",
+        &["pair"],
+        vec![0.001, 0.01, 0.1, 0.5, 1.0, 2.0, 5.0, 10.0, 30.0]
+    )
+    .unwrap()
+});
+
+/// HyperLiquid l2Book 推送延迟（服务端时间戳 → 本地收到，ms），按 pair 分维度
+static HL_ORDERBOOK_LATENCY_MS: LazyLock<GaugeVec> = LazyLock::new(|| {
+    register_gauge_vec!(
         "hl_orderbook_latency_ms",
         "HyperLiquid l2Book push latency in milliseconds (received_at - server created_at)",
         &["pair"]
-    ).unwrap();
+    )
+    .unwrap()
+});
 
-    // ── 原始价格 ──────────────────────────────────────────────────────────
-    /// EVM DEX 聚合最优价（USDC per token1），side=buy|sell，按 pair 分维度
-    static ref EVM_PRICE_USDC: GaugeVec = register_gauge_vec!(
+// ── 原始价格 ──────────────────────────────────────────────────────────────
+/// EVM DEX 聚合最优价（USDC per token1），side=buy|sell，按 pair 分维度
+static EVM_PRICE_USDC: LazyLock<GaugeVec> = LazyLock::new(|| {
+    register_gauge_vec!(
         "evm_price_usdc",
         "Best EVM DEX price in USDC per token1 (buy: best sell quote / token1, sell: best buy quote / token1)",
         &["side", "pair"]
-    ).unwrap();
+    )
+    .unwrap()
+});
 
-    /// HyperLiquid 订单簿价格（USDC per token1），side=ask|bid，按 pair 分维度
-    static ref HL_PRICE_USDC: GaugeVec = register_gauge_vec!(
+/// HyperLiquid 订单簿价格（USDC per token1），side=ask|bid，按 pair 分维度
+static HL_PRICE_USDC: LazyLock<GaugeVec> = LazyLock::new(|| {
+    register_gauge_vec!(
         "hl_price_usdc",
         "HyperLiquid orderbook price in USDC per token1",
         &["side", "pair"]
-    ).unwrap();
+    )
+    .unwrap()
+});
 
-    /// 最新处理的 EVM 区块号（用于判断 EVM 数据是否滞后）
-    static ref EVM_LATEST_BLOCK: Gauge = register_gauge!(
+/// 最新处理的 EVM 区块号（用于判断 EVM 数据是否滞后）
+static EVM_LATEST_BLOCK: LazyLock<Gauge> = LazyLock::new(|| {
+    register_gauge!(
         "evm_latest_block_number",
         "Latest EVM block number processed by EvmWatcher"
-    ).unwrap();
-}
+    )
+    .unwrap()
+});
 
-/// 启动时触发 lazy_static 注册。
-/// 含 pair 标签的指标在运行时按 pair 名自动注册，无需预热。
+/// 启动时注册无标签指标；含 pair 标签的指标在首次埋点时自动注册。
 pub fn init() {
-    let _ = &*HL_ORDERBOOK_LATENCY_MS;
-    let _ = &*PRICE_DIFF_BPS;
-    let _ = &*MIN_PROFIT_BPS;
-    let _ = &*ARB_TRIGGER_TOTAL;
-    let _ = &*ARB_DRY_RUN_TRIGGER_TOTAL;
-    let _ = &*EVM_SWAP_TOTAL;
-    let _ = &*REQUOTE_ABORTED_TOTAL;
-    let _ = &*EVM_SWAP_AMOUNT_OUT_TOTAL;
-    let _ = &*LIQUID_ORDER_TOTAL;
-    let _ = &*LIQUID_FILLED_SIZE_TOTAL;
-    let _ = &*ARB_EXECUTION_DURATION;
-    let _ = &*EVM_PRICE_USDC;
-    let _ = &*HL_PRICE_USDC;
     let _ = &*EVM_LATEST_BLOCK;
 }
 
@@ -163,15 +211,30 @@ pub fn record_arb_dry_run_triggered(pair: &str, direction: &str) {
         .inc();
 }
 
-pub fn record_evm_swap_success(pair: &str, amount_out: f64) {
+pub fn record_evm_swap_success(pair: &str, direction: &str, amount_out: f64) {
     EVM_SWAP_TOTAL.with_label_values(&["success", pair]).inc();
     EVM_SWAP_AMOUNT_OUT_TOTAL
-        .with_label_values(&[pair])
+        .with_label_values(&[direction, pair])
         .inc_by(amount_out);
 }
 
 pub fn record_evm_swap_failed(pair: &str) {
     EVM_SWAP_TOTAL.with_label_values(&["failed", pair]).inc();
+}
+
+/// 发送 tx 之前安全放弃（链上零资金变动）
+pub fn record_evm_swap_aborted(pair: &str) {
+    EVM_SWAP_TOTAL.with_label_values(&["aborted", pair]).inc();
+}
+
+/// 执行结果不明（超时/链上成功但金额未知），需人工核对
+pub fn record_evm_swap_unknown(pair: &str) {
+    EVM_SWAP_TOTAL.with_label_values(&["unknown", pair]).inc();
+}
+
+/// 进入 RecoveryRequired，pair 停止交易——应配置最高优先级告警
+pub fn record_arb_recovery_required(pair: &str) {
+    ARB_RECOVERY_REQUIRED_TOTAL.with_label_values(&[pair]).inc();
 }
 
 /// 执行前 re-quote 发现价格恶化、放弃 swap（未发链上 tx）
@@ -198,6 +261,11 @@ pub fn record_liquid_order_failed(pair: &str) {
     LIQUID_ORDER_TOTAL
         .with_label_values(&["failed", pair])
         .inc();
+}
+
+/// 记录 execution_gate 抢锁等待时间
+pub fn record_execution_gate_wait(pair: &str, secs: f64) {
+    EXECUTION_GATE_WAIT.with_label_values(&[pair]).observe(secs);
 }
 
 /// 记录套利全链路耗时（从发出 EvmSwap 到收到 Liquid 结果）

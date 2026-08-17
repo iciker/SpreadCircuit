@@ -13,8 +13,10 @@ use crate::{
 };
 
 const CHANNEL_L2BOOK: &str = "l2Book";
-/// 用于 JSON 文本的廉价预筛选，包含引号以避免匹配非 channel 字段
-const CHANNEL_L2BOOK_QUOTED: &str = "\"l2Book\"";
+/// 无任何消息超过此时长视为半开连接，断开重连（l2Book 每个块都有推送）
+const IDLE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
+/// 关闭期间轮询订阅者数量的间隔
+const SHUTDOWN_POLL: std::time::Duration = std::time::Duration::from_millis(200);
 
 /// 订阅多个 symbol 的订单簿，共享单一 WebSocket 连接
 pub async fn run(
@@ -27,6 +29,7 @@ pub async fn run(
         || connect_and_listen(&config, &symbols, &tx, &shutdown),
         "OrderBookWatcher",
         &shutdown,
+        &config,
     )
     .await;
     info!("[OrderBookWatcher] 已退出");
@@ -58,31 +61,41 @@ async fn connect_and_listen(
     }
 
     loop {
+        // 收到关闭信号后不立即退出：在途套利的第二腿仍需要新鲜订单簿完成对冲，
+        // 等所有 ArbEngine 退出（订阅者归零）后再停止推送
+        if shutdown.is_cancelled() && tx.receiver_count() == 0 {
+            return Ok(());
+        }
         tokio::select! {
-            msg = ws.next() => {
+            msg = tokio::time::timeout(IDLE_TIMEOUT, ws.next()) => {
                 match msg {
-                    Some(Ok(Message::Text(text))) => {
+                    Ok(Some(Ok(Message::Text(text)))) => {
                         if let Some(ob) = parse_orderbook(&text) {
-                            if tx.send(ob).is_err() {
+                            if tx.send(ob).is_err() && !shutdown.is_cancelled() {
                                 warn!("[OrderBookWatcher] 无订阅者，orderbook 已丢弃");
                             }
+                        } else if text.contains("\"channel\":\"error\"") {
+                            // 订阅被拒绝等服务端错误必须可见，否则 pair 永久无数据且无告警
+                            warn!(message = %text, "[OrderBookWatcher] 服务端错误消息");
                         }
                     }
-                    Some(Err(e)) => return Err(e.into()),
-                    None => return Err(anyhow::anyhow!("WS stream ended")),
-                    _ => {}
+                    Ok(Some(Err(e))) => return Err(e.into()),
+                    Ok(None) => return Err(anyhow::anyhow!("WS stream ended")),
+                    Ok(_) => {}
+                    Err(_) => {
+                        return Err(anyhow::anyhow!(
+                            "WS 超过 {IDLE_TIMEOUT:?} 无消息，判定半开连接，重连"
+                        ))
+                    }
                 }
             }
-            _ = shutdown.cancelled() => return Ok(()),
+            _ = shutdown.cancelled(), if !shutdown.is_cancelled() => {}
+            _ = tokio::time::sleep(SHUTDOWN_POLL), if shutdown.is_cancelled() => {}
         }
     }
 }
 
 pub fn parse_orderbook(text: &str) -> Option<OrderBook> {
-    // 廉价字符串预筛选，避免对非 l2Book 消息做完整 JSON 解析
-    if !text.contains(CHANNEL_L2BOOK_QUOTED) {
-        return None;
-    }
     let v: Value = serde_json::from_str(text).ok()?;
     if v["channel"] != CHANNEL_L2BOOK {
         return None;

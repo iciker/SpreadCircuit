@@ -15,10 +15,12 @@ use crate::{
     config::{Config, PairConfig},
     evm::{
         algebra_client::{algebra_swap_exact_input_single, AlgebraQuoterClient},
+        build_quoters,
         client::{
-            build_http_provider, erc20_balance, from_bigint, swap_exact_input_single, to_bigint,
-            EvmClient, SwapOutcome, SwapRequest,
+            erc20_balance, from_bigint, swap_exact_input_single, to_bigint, EthProvider, EvmClient,
+            SwapOutcome, SwapRequest, TransferEventMissing,
         },
+        is_valid_quote,
     },
     types::{
         commands::{EvmSwapRequest, TradeResult},
@@ -28,13 +30,23 @@ use crate::{
 
 use super::BPS;
 
-/// 价格恶化错误前缀，用于区分"盈利验证放弃"（不发 tx）和"链上失败"两类错误。
-///
-/// **约定**：`execute_swap` 的 `bail!` 消息必须以此常量开头，
-/// 调用方通过 `starts_with(PRICE_DETERIORATED)` 匹配。
-/// 修改此值或 `bail!` 格式时须同步更新两处，否则匹配静默失效。
-pub(crate) const PRICE_DETERIORATED: &str = "价格已恶化";
+/// 价格恶化错误前缀，仅用于本模块内区分 requote_aborted 指标子集。
+const PRICE_DETERIORATED: &str = "价格已恶化";
 const EXECUTION_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(90);
+
+/// 发送 tx 之前的安全失败标记：链上零资金变动，可直接放弃本轮。
+/// `plan_swap` 的所有错误统一包装为此类型，`map_swap_result` 据此产出
+/// `TradeResult::EvmSwapAborted`（而非需人工恢复的 `EvmSwapFailed`）。
+#[derive(Debug)]
+struct SafeAbort(String);
+
+impl std::fmt::Display for SafeAbort {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.0)
+    }
+}
+
+impl std::error::Error for SafeAbort {}
 
 /// 链上 `amountOutMinimum` 同时受滑点和经济盈亏平衡线约束，不能低于任一者。
 pub fn guarded_amount_out_min(
@@ -61,6 +73,7 @@ pub fn guarded_amount_out_min(
 pub async fn run(
     config: Arc<Config>,
     pair: Arc<PairConfig>,
+    quote_provider: EthProvider,
     mut rx: mpsc::Receiver<EvmSwapRequest>,
     tx: mpsc::Sender<TradeResult>,
     execution_gate: Arc<Mutex<()>>,
@@ -88,8 +101,9 @@ pub async fn run(
         .wallet(wallet)
         .on_http(url);
 
-    // 报价客户端：独立 HTTP provider，无需签名，仅用于执行前实时 re-quote
-    let (prjx_quoter, hyper_quoter, kitten_quoter) = match build_quoters(&config) {
+    // 报价客户端：复用进程级共享 HTTP 连接池（与 EvmWatcher 同池，常年温热），
+    // 无需签名，仅用于执行前实时 re-quote
+    let (prjx_quoter, hyper_quoter, kitten_quoter) = match build_quoters(quote_provider, &config) {
         Ok(q) => q,
         Err(e) => {
             error!(error = %e, "[EvmTrader] 报价客户端初始化失败，退出");
@@ -97,7 +111,9 @@ pub async fn run(
         }
     };
     while let Some(cmd) = rx.recv().await {
+        let gate_wait = std::time::Instant::now();
         let _wallet_guard = execution_gate.lock().await;
+        crate::metrics::record_execution_gate_wait(&pair.symbol, gate_wait.elapsed().as_secs_f64());
         let execution = tokio::time::timeout(
             EXECUTION_TIMEOUT,
             execute_swap(
@@ -113,10 +129,13 @@ pub async fn run(
         )
         .await;
         let result = match execution {
-            Ok(result) => map_swap_result(&pair, &cmd, result),
-            Err(_) => TradeResult::EvmSwapUnknown {
-                reason: "EVM 交易执行超时".into(),
-            },
+            Ok(result) => map_swap_result(&config, &pair, &cmd, result),
+            Err(_) => {
+                crate::metrics::record_evm_swap_unknown(&pair.symbol);
+                TradeResult::EvmSwapUnknown {
+                    reason: "EVM 交易执行超时".into(),
+                }
+            }
         };
         if tx.send(result).await.is_err() {
             error!("[EvmTrader] result channel closed");
@@ -127,6 +146,7 @@ pub async fn run(
 }
 
 fn map_swap_result(
+    config: &Config,
     pair: &PairConfig,
     request: &EvmSwapRequest,
     result: Result<(SwapOutcome, DexName)>,
@@ -134,21 +154,40 @@ fn map_swap_result(
     match result {
         Ok((outcome, execution_dex)) => {
             info!(amount_in = request.amount_in, amount_out = outcome.amount_out, tx_hash = %outcome.tx_hash, dex = %execution_dex, quoted_dex = %request.dex, symbol = %pair.symbol, "[EvmTrader] swap 成功");
-            crate::metrics::record_evm_swap_success(&pair.symbol, outcome.amount_out);
+            // buy_diff 方向 amount_out 是 USDC，sell_diff 方向是 token1，按方向分维度
+            let direction = if request.is_buy {
+                "sell_diff"
+            } else {
+                "buy_diff"
+            };
+            crate::metrics::record_evm_swap_success(&pair.symbol, direction, outcome.amount_out);
             TradeResult::EvmSwapSuccess {
                 amount_out: outcome.amount_out,
                 tx_hash: outcome.tx_hash,
             }
         }
         Err(error) => {
-            let reason = error.to_string();
-            if reason.starts_with(PRICE_DETERIORATED) {
-                warn!(reason, dex = %request.dex, symbol = %pair.symbol, "[EvmTrader] re-quote 后放弃 swap");
-                crate::metrics::record_requote_aborted(&pair.symbol);
-            } else {
-                error!(reason, dex = %request.dex, symbol = %pair.symbol, "[EvmTrader] swap 失败");
-                crate::metrics::record_evm_swap_failed(&pair.symbol);
+            // 计划阶段（发送 tx 之前）的失败：零资金变动，安全放弃本轮
+            if let Some(abort) = error.downcast_ref::<SafeAbort>() {
+                let reason = config.redact_rpc(&abort.0);
+                warn!(reason, dex = %request.dex, symbol = %pair.symbol, "[EvmTrader] 发送前安全放弃 swap");
+                crate::metrics::record_evm_swap_aborted(&pair.symbol);
+                if reason.contains(PRICE_DETERIORATED) {
+                    crate::metrics::record_requote_aborted(&pair.symbol);
+                }
+                return TradeResult::EvmSwapAborted { reason };
             }
+            // 链上已成功、资金已划转，仅金额未知——类型化分流，不计入 failed
+            if let Some(missing) = error.downcast_ref::<TransferEventMissing>() {
+                error!(tx_hash = %missing.tx_hash, dex = %request.dex, symbol = %pair.symbol, "[EvmTrader] swap 链上成功但金额未知");
+                crate::metrics::record_evm_swap_unknown(&pair.symbol);
+                return TradeResult::EvmSwapConfirmedAmountUnknown {
+                    tx_hash: missing.tx_hash.clone(),
+                };
+            }
+            let reason = config.redact_rpc(&error.to_string());
+            error!(reason, dex = %request.dex, symbol = %pair.symbol, "[EvmTrader] swap 失败");
+            crate::metrics::record_evm_swap_failed(&pair.symbol);
             TradeResult::EvmSwapFailed { reason }
         }
     }
@@ -170,21 +209,50 @@ where
     T: Transport + Clone,
     P: Provider<T>,
 {
-    let (token_in_str, token_out_str, decimals_in, decimals_out) = if request.is_buy {
-        (
-            pair.token0.as_str(),
-            pair.token1.as_str(),
-            pair.decimals0,
-            pair.decimals1,
-        )
-    } else {
-        (
-            pair.token1.as_str(),
-            pair.token0.as_str(),
-            pair.decimals1,
-            pair.decimals0,
-        )
-    };
+    // 计划阶段全部发生在发送 tx 之前，任何失败（re-quote 失败、盈利消失、
+    // 余额不足、配置/解析错误、balance/nonce RPC 错误）都是零资金变动的安全放弃
+    let (swap_request, execution_dex, nonce) = plan_swap(
+        provider,
+        prjx_quoter,
+        hyper_quoter,
+        kitten_quoter,
+        config,
+        pair,
+        address,
+        request,
+    )
+    .await
+    .map_err(|error| SafeAbort(format!("{error:#}")))?;
+
+    // 从这里开始进入发送阶段（approve + swap 都是真实 tx），失败必须 fail-closed
+    let outcome = match execution_dex {
+        DexName::Kitten => algebra_swap_exact_input_single(provider, &swap_request, nonce).await,
+        // PRJX 和 HyperSwap 都使用 Uniswap V3 兼容接口（ISwapRouter01）。
+        DexName::Prjx | DexName::HyperSwap => {
+            swap_exact_input_single(provider, &swap_request, nonce).await
+        }
+    }?;
+    Ok((outcome, execution_dex))
+}
+
+/// swap 计划阶段：re-quote 选路 → 盈利验证 → 余额/nonce 查询 → 路由解析。
+/// 本函数不发送任何交易；所有错误均可安全放弃本轮。
+#[allow(clippy::too_many_arguments)]
+async fn plan_swap<T, P>(
+    provider: &P,
+    prjx_quoter: &EvmClient,
+    hyper_quoter: &EvmClient,
+    kitten_quoter: Option<&AlgebraQuoterClient>,
+    config: &Config,
+    pair: &PairConfig,
+    address: Address,
+    request: &EvmSwapRequest,
+) -> Result<(SwapRequest, DexName, u64)>
+where
+    T: Transport + Clone,
+    P: Provider<T>,
+{
+    let (token_in_str, token_out_str, decimals_in, decimals_out) = swap_legs(pair, request.is_buy);
     let token_in: Address = token_in_str.parse()?;
     let token_out: Address = token_out_str.parse()?;
 
@@ -278,31 +346,16 @@ where
         amount_in: request.amount_in,
         amount_out_min,
     };
-
-    let amount_out = match execution_dex {
-        DexName::Kitten => algebra_swap_exact_input_single(provider, &swap_request, nonce).await,
-        // PRJX 和 HyperSwap 都使用 Uniswap V3 兼容接口（ISwapRouter01）。
-        DexName::Prjx | DexName::HyperSwap => {
-            swap_exact_input_single(provider, &swap_request, nonce).await
-        }
-    }?;
-    Ok((amount_out, execution_dex))
+    Ok((swap_request, execution_dex, nonce))
 }
 
-/// 初始化三个 DEX 报价客户端，共享同一 HTTP 连接池
-fn build_quoters(config: &Config) -> Result<(EvmClient, EvmClient, Option<AlgebraQuoterClient>)> {
-    let http = build_http_provider(&config.https_rpc)?;
-    let prjx_q = EvmClient::from_provider(http.clone(), &config.prjx_quotev2)?;
-    let hyper_q = EvmClient::from_provider(http.clone(), &config.hyperswap_quotev2)?;
-    let kitten_q = if !config.kitten_quoter.is_empty() && !config.kitten_router.is_empty() {
-        Some(AlgebraQuoterClient::from_provider(
-            http,
-            &config.kitten_quoter,
-        )?)
+/// 按方向返回 (token_in, token_out, decimals_in, decimals_out)
+fn swap_legs(pair: &PairConfig, is_buy: bool) -> (&str, &str, u8, u8) {
+    if is_buy {
+        (&pair.token0, &pair.token1, pair.decimals0, pair.decimals1)
     } else {
-        None
-    };
-    Ok((prjx_q, hyper_q, kitten_q))
+        (&pair.token1, &pair.token0, pair.decimals1, pair.decimals0)
+    }
 }
 
 /// 对实际交易金额做实时链上报价
@@ -317,30 +370,22 @@ async fn requote_best(
     is_buy: bool,
     amount_in: f64,
 ) -> Result<(f64, DexName)> {
-    let (token_in, token_out, decimals_in, decimals_out) = if is_buy {
-        (
-            pair.token0.as_str(),
-            pair.token1.as_str(),
-            pair.decimals0,
-            pair.decimals1,
-        )
-    } else {
-        (
-            pair.token1.as_str(),
-            pair.token0.as_str(),
-            pair.decimals1,
-            pair.decimals0,
-        )
-    };
+    let (token_in, token_out, decimals_in, decimals_out) = swap_legs(pair, is_buy);
     let (prjx, hyper, kitten) = tokio::join!(
-        prjx_quoter.quote_exact_input(
-            token_in,
-            token_out,
-            decimals_in,
-            decimals_out,
-            pair.fee_tier,
-            amount_in,
-        ),
+        async {
+            prjx_quoter
+                .quote_exact_input(
+                    token_in,
+                    token_out,
+                    decimals_in,
+                    decimals_out,
+                    pair.fee_tier,
+                    amount_in,
+                )
+                .await
+                .inspect_err(|e| warn!(error = %e, dex = "prjx", symbol = %pair.symbol, "[EvmTrader] re-quote 失败"))
+                .ok()
+        },
         async {
             if pair.use_hyperswap {
                 hyper_quoter
@@ -353,6 +398,7 @@ async fn requote_best(
                         amount_in,
                     )
                     .await
+                    .inspect_err(|e| warn!(error = %e, dex = "hyperswap", symbol = %pair.symbol, "[EvmTrader] re-quote 失败"))
                     .ok()
             } else {
                 None
@@ -370,6 +416,7 @@ async fn requote_best(
                             amount_in,
                         )
                         .await
+                        .inspect_err(|e| warn!(error = %e, dex = "kitten", symbol = %pair.symbol, "[EvmTrader] re-quote 失败"))
                         .ok(),
                     None => None,
                 }
@@ -380,7 +427,7 @@ async fn requote_best(
     );
 
     let candidates = [
-        (DexName::Prjx, prjx.ok()),
+        (DexName::Prjx, prjx),
         (DexName::HyperSwap, hyper),
         (DexName::Kitten, kitten),
     ];
@@ -395,7 +442,7 @@ pub fn select_best_executable_quote(
         .iter()
         .filter_map(|(dex, amount)| {
             amount
-                .filter(|value| value.is_finite() && *value > 0.0)
+                .filter(|value| is_valid_quote(*value))
                 .map(|value| (value, *dex))
         })
         .max_by(|(left, _), (right, _)| left.total_cmp(right))

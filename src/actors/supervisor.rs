@@ -29,10 +29,6 @@ async fn drain_tasks(tasks: &mut JoinSet<String>) -> Result<()> {
 
 /// 监督关键 actor。任一 actor 在全局取消前退出，都会停止整个进程。
 pub async fn supervise(mut tasks: JoinSet<String>, shutdown: CancellationToken) -> Result<()> {
-    if shutdown.is_cancelled() {
-        return drain_tasks(&mut tasks).await;
-    }
-
     tokio::select! {
             _ = shutdown.cancelled() => {
                 drain_tasks(&mut tasks).await

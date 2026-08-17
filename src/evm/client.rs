@@ -99,7 +99,7 @@ pub struct SwapOutcome {
 }
 
 /// 计算 swap 截止时间：当前 unix 秒 + SWAP_DEADLINE_SECS
-pub(crate) fn swap_deadline() -> Result<U256> {
+pub fn swap_deadline() -> Result<U256> {
     use std::time::{SystemTime, UNIX_EPOCH};
     let now = SystemTime::now().duration_since(UNIX_EPOCH)?.as_secs();
     Ok(U256::from(now + SWAP_DEADLINE_SECS))
@@ -147,7 +147,9 @@ where
     tracing::info!(token = %token, spender = %spender, "[EvmClient] ERC20 approve MAX");
     // 使用无限授权以避免每次 swap 都支付 approve gas（约 $0.01/次）
     // 风险已知：若 router 合约被攻击，钱包该 token 余额可被全部转走
-    // 缓解措施：router 为知名 DEX 合约（HyperSwap/PRJX），地址在 .env 中静态配置
+    // 缓解措施：router 为知名 DEX 合约（HyperSwap/PRJX/KittenSwap Algebra），
+    // 地址在 .env 中静态配置且启动时校验非零；三个 router 均获得无限授权，
+    // 撤销需手动发送 approve(spender, 0)
     let receipt = erc20
         .approve(spender, U256::MAX)
         .nonce(nonce)
@@ -169,6 +171,65 @@ pub fn ensure_transaction_succeeded(status: bool, tx_hash: &str, action: &str) -
     Ok(())
 }
 
+/// swap 公共前置：金额按精度缩放 + 按需 approve。
+/// 返回 (amount_in_raw, amount_out_min_raw, swap_nonce)。
+pub(crate) async fn prepare_swap<T, P>(
+    provider: &P,
+    req: &SwapRequest,
+    nonce: u64,
+) -> Result<(U256, U256, u64)>
+where
+    T: Transport + Clone,
+    P: Provider<T>,
+{
+    let amount_in_raw = to_bigint(req.amount_in, req.decimals_in)?;
+    let amount_out_min_raw = to_bigint_ceil(req.amount_out_min, req.decimals_out)?;
+    let swap_nonce = approve_if_needed(
+        provider,
+        req.token_in,
+        req.recipient,
+        req.router,
+        amount_in_raw,
+        nonce,
+    )
+    .await?;
+    Ok((amount_in_raw, amount_out_min_raw, swap_nonce))
+}
+
+/// swap 公共后置：回执 fail-closed 检查 + 从 Transfer 事件解析实际成交金额。
+pub(crate) fn settle_swap_receipt(
+    receipt: &alloy::rpc::types::TransactionReceipt,
+    req: &SwapRequest,
+    tag: &str,
+) -> Result<SwapOutcome> {
+    let tx_hash = receipt.transaction_hash.to_string();
+    ensure_transaction_succeeded(receipt.status(), &tx_hash, "swap")?;
+
+    // 从 receipt 日志中解析实际成交的 token_out 数量
+    let actual_out = parse_transfer_out(receipt.inner.logs(), req.token_out, req.recipient)
+        .ok_or_else(|| {
+            tracing::error!(
+                tx_hash = %receipt.transaction_hash,
+                "[{tag}] Transfer 事件未找到，链上已成功但实际金额未知"
+            );
+            anyhow::Error::new(TransferEventMissing {
+                tx_hash: receipt.transaction_hash.to_string(),
+            })
+        })?;
+
+    let amount_out = from_bigint(actual_out, req.decimals_out)?;
+    tracing::info!(
+        tx_hash = %receipt.transaction_hash,
+        amount_in = req.amount_in,
+        amount_out,
+        "[{tag}] swap 交易确认"
+    );
+    Ok(SwapOutcome {
+        amount_out,
+        tx_hash,
+    })
+}
+
 /// 执行 exactInputSingle swap，返回实际换出的 token_out 数量
 /// 步骤：approve（按需） → 发送交易 → 等待回执 → 解析 Transfer 事件
 /// nonce：调用方从链上 pending 状态显式获取，直接注入到 tx，绕过 alloy 本地缓存
@@ -181,18 +242,8 @@ where
     T: Transport + Clone,
     P: Provider<T>,
 {
-    let amount_in_raw = to_bigint(req.amount_in, req.decimals_in)?;
-    let amount_out_min_raw = to_bigint_ceil(req.amount_out_min, req.decimals_out)?;
-
-    let swap_nonce = approve_if_needed(
-        provider,
-        req.token_in,
-        req.recipient,
-        req.router,
-        amount_in_raw,
-        nonce,
-    )
-    .await?;
+    let (amount_in_raw, amount_out_min_raw, swap_nonce) =
+        prepare_swap(provider, req, nonce).await?;
 
     let params = ISwapRouter01::ExactInputSingleParams {
         tokenIn: req.token_in,
@@ -205,11 +256,9 @@ where
         sqrtPriceLimitX96: Uint::<160, 3>::ZERO,
     };
 
-    let router = ISwapRouter01::new(req.router, provider);
-
     // 直接发送真实交易（alloy 泛型 Provider 路径下 CallBuilder::from() 不生效，
     // callStatic 会因 msg.sender=0x0 导致 STF，故跳过预验证直接执行）
-    let receipt = router
+    let receipt = ISwapRouter01::new(req.router, provider)
         .exactInputSingle(params)
         .nonce(swap_nonce)
         .send()
@@ -217,37 +266,23 @@ where
         .get_receipt()
         .await?;
 
-    ensure_transaction_succeeded(
-        receipt.status(),
-        &receipt.transaction_hash.to_string(),
-        "swap",
-    )?;
-
-    // 从 receipt 日志中解析实际成交的 token_out 数量
-    let actual_out = parse_transfer_out(receipt.inner.logs(), req.token_out, req.recipient)
-        .ok_or_else(|| {
-            tracing::error!(
-                tx_hash = %receipt.transaction_hash,
-                "[EvmClient] Transfer 事件未找到，链上已成功但实际金额未知"
-            );
-            anyhow::anyhow!("{TRANSFER_EVENT_MISSING}:{}", receipt.transaction_hash)
-        })?;
-
-    let amount_out = from_bigint(actual_out, req.decimals_out)?;
-    tracing::info!(
-        tx_hash = %receipt.transaction_hash,
-        amount_in = req.amount_in,
-        amount_out,
-        "[EvmClient] swap 交易确认"
-    );
-    Ok(SwapOutcome {
-        amount_out,
-        tx_hash: receipt.transaction_hash.to_string(),
-    })
+    settle_swap_receipt(&receipt, req, "EvmClient")
 }
 
-/// swap 链上成功但找不到 Transfer 事件时的语义错误字符串，供调用方 match
-pub const TRANSFER_EVENT_MISSING: &str = "transfer_event_missing";
+/// swap 链上成功但未找到 Transfer 事件：资金已划转、实际金额未知。
+/// 类型化错误供调用方 downcast，避免跨模块字符串前缀契约。
+#[derive(Debug)]
+pub struct TransferEventMissing {
+    pub tx_hash: String,
+}
+
+impl std::fmt::Display for TransferEventMissing {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "transfer_event_missing:{}", self.tx_hash)
+    }
+}
+
+impl std::error::Error for TransferEventMissing {}
 
 /// 从 tx receipt 日志中提取 ERC20 Transfer(to=recipient) 的转账金额
 /// swap 成功后用于获取实际成交的 token_out 数量
