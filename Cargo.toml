@@ -1,0 +1,50 @@
+[package]
+name = "spread-circuit"
+version = "0.1.0"
+edition = "2021"
+rust-version = "1.81"
+license = "AGPL-3.0-only"
+
+[dependencies]
+# EVM
+alloy = { version = "0.9", features = ["full"] }
+
+# HyperLiquid
+hyperliquid_rust_sdk = "0.6"
+
+# ethers（hyperliquid_rust_sdk 使用 ethers::signers::LocalWallet）
+ethers = "2"
+
+# Async runtime
+tokio = { version = "1", features = ["full"] }
+tokio-util = { version = "0.7", features = ["rt"] }
+
+# WebSocket
+tokio-tungstenite = { version = "0.24", features = ["native-tls"] }
+
+# Stream 工具
+futures-util = "0.3"
+
+# SQLite
+rusqlite = { version = "0.32", features = ["bundled"] }
+
+# 日志
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter", "json"] }
+tracing-appender = "0.2"
+
+# 序列化（固定到 1.0.219：serde >=1.0.220 的某版本引入 __private{N} 命名，
+# 与 alloy-consensus 0.9.x 直接使用 serde::__private 不兼容）
+serde = { version = "=1.0.219", features = ["derive"] }
+serde_json = "1"
+
+# 配置
+dotenvy = "0.15"
+
+# 错误处理
+anyhow = "1"
+
+# 监控
+lazy_static = "1"
+prometheus = { version = "0.13", features = ["process"] }
+axum = "0.7"
