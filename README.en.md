@@ -427,8 +427,6 @@ cargo clippy --all-targets --all-features -- -D warnings
 cargo test --all-targets --all-features --no-fail-fast
 ```
 
-The public repository distributes production source code and formal operational documentation only. Internal tests and diagnostic tools are not published.
-
 ## Project structure
 
 | Path | Purpose |

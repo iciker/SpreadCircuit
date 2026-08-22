@@ -358,7 +358,7 @@ pub struct ArbEngine {
 }
 
 impl ArbEngine {
-    // Actor 的输入输出保持为显式参数，避免再引入只用于构造的 channel 包装结构。
+    // Actor 的输入输出使用显式参数，构造依赖保持可见。
     #[allow(clippy::too_many_arguments)]
     pub fn new(
         global: Arc<Config>,

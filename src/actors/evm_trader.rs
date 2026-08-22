@@ -193,7 +193,7 @@ fn map_swap_result(
     }
 }
 
-// 显式传入只读报价资源，避免恢复仅用于这一处调用的依赖包装结构。
+// 显式传入只读报价资源，使执行依赖保持可见。
 #[allow(clippy::too_many_arguments)]
 async fn execute_swap<T, P>(
     provider: &P,

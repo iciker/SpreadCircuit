@@ -427,8 +427,6 @@ cargo clippy --all-targets --all-features -- -D warnings
 cargo test --all-targets --all-features --no-fail-fast
 ```
 
-公开仓库仅分发生产代码和正式运行文档；内部测试与诊断工具不随仓库发布。
-
 ## 项目结构
 
 | 路径 | 作用 |
